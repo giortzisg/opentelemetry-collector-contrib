@@ -8,8 +8,10 @@ package sentryexporter // import "github.com/open-telemetry/opentelemetry-collec
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/exporter"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
@@ -21,11 +23,16 @@ func NewFactory() exporter.Factory {
 		metadata.Type,
 		createDefaultConfig,
 		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
+		exporter.WithLogs(createLogsExporter, metadata.LogsStability),
 	)
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{}
+	return &Config{
+		ClientConfig: confighttp.ClientConfig{
+			Timeout: 30 * time.Second,
+		},
+	}
 }
 
 func createTracesExporter(
@@ -39,6 +46,19 @@ func createTracesExporter(
 	}
 
 	// Create exporter based on sentry config.
-	exp, err := createSentryExporter(sentryConfig, params)
-	return exp, err
+	return newSentryExporter(sentryConfig, params)
+}
+
+func createLogsExporter(
+	_ context.Context,
+	set exporter.Settings,
+	config component.Config,
+) (exporter.Logs, error) {
+	sentryConfig, ok := config.(*Config)
+	if !ok {
+		return nil, fmt.Errorf("unexpected config type: %T", config)
+	}
+
+	// Create exporter based on sentry config.
+	return newSentryExporter(sentryConfig, set)
 }

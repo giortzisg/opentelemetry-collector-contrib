@@ -4,35 +4,63 @@
 package sentryexporter
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/exporter/exportertest"
-
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
 )
 
-func TestCreateDefaultConfig(t *testing.T) {
+func TestNewFactory(t *testing.T) {
 	factory := NewFactory()
-	cfg := factory.CreateDefaultConfig()
-	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
+	assert.NotNil(t, factory)
+	assert.Equal(t, "sentry", factory.Type().String())
 }
 
-func TestCreateExporter(t *testing.T) {
-	factory := NewFactory()
-	assert.Equal(t, metadata.Type, factory.Type())
-
-	cfg := factory.CreateDefaultConfig()
-	eCfg := cfg.(*Config)
-	params := exportertest.NewNopSettings(metadata.Type)
-
-	te, err := factory.CreateTraces(t.Context(), params, eCfg)
-	assert.NoError(t, err)
-	assert.NotNil(t, te, "failed to create trace exporter")
-
-	me, err := factory.CreateMetrics(t.Context(), params, eCfg)
+func TestCreateDefaultConfig(t *testing.T) {
+	cfg := createDefaultConfig()
+	assert.NotNil(t, cfg)
+	err := cfg.(*Config).Validate()
 	assert.Error(t, err)
-	assert.Nil(t, me)
+	assert.Contains(t, err.Error(), "either 'dsn_mode' or 'dynamic_mode' must be configured")
+}
+
+func TestCreateTracesExporter(t *testing.T) {
+	factory := NewFactory()
+	cfg := &Config{
+		DSNMode: &DSNModeConfig{
+			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
+		},
+	}
+
+	set := exportertest.NewNopSettings(factory.Type())
+	exp, err := createTracesExporter(context.Background(), set, cfg)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, exp)
+}
+
+func TestCreateLogsExporter(t *testing.T) {
+	factory := NewFactory()
+	cfg := &Config{
+		DSNMode: &DSNModeConfig{
+			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
+		},
+	}
+
+	set := exportertest.NewNopSettings(factory.Type())
+	exp, err := createLogsExporter(context.Background(), set, cfg)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, exp)
+}
+
+func TestCreateExporterWithInvalidConfig(t *testing.T) {
+	factory := NewFactory()
+	cfg := &Config{} // Invalid: no DSNMode or DynamicMode config
+
+	set := exportertest.NewNopSettings(factory.Type())
+	_, err := createTracesExporter(context.Background(), set, cfg)
+
+	assert.Error(t, err)
 }

@@ -4,511 +4,444 @@
 package sentryexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter"
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"maps"
+	"io"
 	"net/http"
-	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/getsentry/sentry-go"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
-	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace"
-	conventions "go.opentelemetry.io/otel/semconv/v1.18.0"
-
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"go.uber.org/zap"
 )
 
-const (
-	otelSentryExporterVersion = "0.0.2"
-	otelSentryExporterName    = "sentry.opentelemetry"
-)
-
-// See OpenTelemetry span statuses in https://github.com/open-telemetry/opentelemetry-proto/blob/6cf77b2f544f6bc7fe1e4b4a8a52e5a42cb50ead/opentelemetry/proto/trace/v1/trace.proto#L303
-
-// OpenTelemetry span status can be Unset, Ok, Error. HTTP and Grpc codes contained in tags can make it more detailed.
-
-// canonicalCodesHTTPMap maps some HTTP codes to Sentry's span statuses. See possible mapping in https://develop.sentry.dev/sdk/event-payloads/span/
-var canonicalCodesHTTPMap = map[string]sentry.SpanStatus{
-	"400": sentry.SpanStatusFailedPrecondition, // SpanStatusInvalidArgument, SpanStatusOutOfRange
-	"401": sentry.SpanStatusUnauthenticated,
-	"403": sentry.SpanStatusPermissionDenied,
-	"404": sentry.SpanStatusNotFound,
-	"409": sentry.SpanStatusAborted, // SpanStatusAlreadyExists
-	"429": sentry.SpanStatusResourceExhausted,
-	"499": sentry.SpanStatusCanceled,
-	"500": sentry.SpanStatusInternalError, // SpanStatusDataLoss, SpanStatusUnknown
-	"501": sentry.SpanStatusUnimplemented,
-	"503": sentry.SpanStatusUnavailable,
-	"504": sentry.SpanStatusDeadlineExceeded,
-}
-
-// canonicalCodesGrpcMap maps some GRPC codes to Sentry's span statuses. See description in grpc documentation.
-var canonicalCodesGrpcMap = map[string]sentry.SpanStatus{
-	"1":  sentry.SpanStatusCanceled,
-	"2":  sentry.SpanStatusUnknown,
-	"3":  sentry.SpanStatusInvalidArgument,
-	"4":  sentry.SpanStatusDeadlineExceeded,
-	"5":  sentry.SpanStatusNotFound,
-	"6":  sentry.SpanStatusAlreadyExists,
-	"7":  sentry.SpanStatusPermissionDenied,
-	"8":  sentry.SpanStatusResourceExhausted,
-	"9":  sentry.SpanStatusFailedPrecondition,
-	"10": sentry.SpanStatusAborted,
-	"11": sentry.SpanStatusOutOfRange,
-	"12": sentry.SpanStatusUnimplemented,
-	"13": sentry.SpanStatusInternalError,
-	"14": sentry.SpanStatusUnavailable,
-	"15": sentry.SpanStatusDataLoss,
-	"16": sentry.SpanStatusUnauthenticated,
-}
-
-// sentryExporter defines the Sentry Exporter.
 type sentryExporter struct {
-	transport   transport
-	environment string
+	config *Config
+	logger *zap.Logger
+	client *http.Client
+
+	dsnEndpoint *OTLPEndpoints
+
+	sentryClient      *SentryClient
+	projectToEndpoint sync.Map
+	attributeKey      string
+	projectMapping    map[string]string
+	defaultTeamSlug   string
 }
 
-// pushTraceData takes an incoming OpenTelemetry trace, converts them into Sentry spans and transactions
-// and sends them using Sentry's transport.
-func (s *sentryExporter) pushTraceData(_ context.Context, td ptrace.Traces) error {
-	var exceptionEvents []*sentry.Event
-	resourceSpans := td.ResourceSpans()
-	if resourceSpans.Len() == 0 {
+// pushTraceData takes an incoming OpenTelemetry trace, and forwards it to the Sentry OTLP endpoint.
+func (e *sentryExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
+	if td.SpanCount() == 0 {
 		return nil
 	}
 
-	maybeOrphanSpans := make([]*sentry.Span, 0, td.SpanCount())
+	if e.config.IsDSNMode() {
+		return e.sendTracesToEndpoint(ctx, td, e.dsnEndpoint)
+	}
 
-	// Maps all child span ids to their root span.
-	idMap := make(map[sentry.SpanID]sentry.SpanID)
-	// Maps root span id to a transaction.
-	transactionMap := make(map[sentry.SpanID]*sentry.Event)
+	return e.routeTracesByProject(ctx, td)
+}
 
-	for i := 0; i < resourceSpans.Len(); i++ {
-		rs := resourceSpans.At(i)
-		resourceTags := generateTagsFromResource(rs.Resource())
+// routeTracesByProject splits traces by project and sends each batch to the appropriate endpoint
+func (e *sentryExporter) routeTracesByProject(ctx context.Context, td ptrace.Traces) error {
+	type projectKey struct {
+		slug     string
+		platform string
+	}
+	projectGroups := make(map[projectKey]ptrace.Traces)
 
-		ilss := rs.ScopeSpans()
-		for j := 0; j < ilss.Len(); j++ {
-			ils := ilss.At(j)
-			library := ils.Scope()
+	for i := 0; i < td.ResourceSpans().Len(); i++ {
+		rs := td.ResourceSpans().At(i)
+		attrs := rs.Resource().Attributes()
+		projectSlug := e.extractProjectSlug(attrs)
 
-			spans := ils.Spans()
-			for k := 0; k < spans.Len(); k++ {
-				otelSpan := spans.At(k)
-				sentrySpan := convertToSentrySpan(otelSpan, library, resourceTags)
-				convertEventsToSentryExceptions(&exceptionEvents, otelSpan.Events(), sentrySpan)
+		if projectSlug == "" {
+			e.logger.Warn("Dropping trace: missing required routing attribute",
+				zap.String("attribute", e.attributeKey))
+			continue
+		}
 
-				// If a span is a root span, we consider it the start of a Sentry transaction.
-				// We should then create a new transaction for that root span, and keep track of it.
-				//
-				// If the span is not a root span, we can either associate it with an existing
-				// transaction, or we can temporarily consider it an orphan span.
-				if spanIsTransaction(otelSpan) {
-					transactionMap[sentrySpan.SpanID] = transactionFromSpan(sentrySpan, s.environment)
-					idMap[sentrySpan.SpanID] = sentrySpan.SpanID
-				} else {
-					if rootSpanID, ok := idMap[sentrySpan.ParentSpanID]; ok {
-						idMap[sentrySpan.SpanID] = rootSpanID
-						transactionMap[rootSpanID].Spans = append(transactionMap[rootSpanID].Spans, sentrySpan)
-					} else {
-						maybeOrphanSpans = append(maybeOrphanSpans, sentrySpan)
-					}
-				}
+		platform := e.extractPlatform(attrs)
+		key := projectKey{slug: projectSlug, platform: platform}
+
+		if _, exists := projectGroups[key]; !exists {
+			projectGroups[key] = ptrace.NewTraces()
+		}
+		rs.CopyTo(projectGroups[key].ResourceSpans().AppendEmpty())
+	}
+
+	var errs error
+	for key, traces := range projectGroups {
+		endpoint, err := e.getOrCreateProjectEndpoint(ctx, key.slug, key.platform)
+		if err != nil {
+			e.logger.Error("Failed to get endpoint for project",
+				zap.String("project", key.slug),
+				zap.Error(err))
+			errs = errors.Join(errs, err)
+			continue
+		}
+
+		if err := e.sendTracesToEndpoint(ctx, traces, endpoint); err != nil {
+			var httpErr *sentryHTTPError
+			if errors.As(err, &httpErr) && (httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId")) {
+				e.logger.Warn("Project may have been deleted, invalidating cache",
+					zap.String("project", key.slug),
+					zap.Int("status_code", httpErr.statusCode))
+				e.projectToEndpoint.Delete(key.slug)
 			}
+
+			e.logger.Error("Failed to send traces to project",
+				zap.String("project", key.slug),
+				zap.Error(err))
+			errs = errors.Join(errs, err)
 		}
 	}
 
-	if len(transactionMap) == 0 {
-		return nil
+	return errs
+}
+
+// sendTracesToEndpoint sends traces to a specific endpoint
+func (e *sentryExporter) sendTracesToEndpoint(ctx context.Context, td ptrace.Traces, endpoint *OTLPEndpoints) error {
+	request := ptraceotlp.NewExportRequestFromTraces(td)
+	data, err := request.MarshalProto()
+	if err != nil {
+		return fmt.Errorf("failed to marshal traces: %w", err)
 	}
 
-	// After the first pass through, we can't necessarily make the assumption we have not associated all
-	// the spans with a transaction. As such, we must classify the remaining spans as orphans or not.
-	orphanSpans := classifyAsOrphanSpans(maybeOrphanSpans, len(maybeOrphanSpans)+1, idMap, transactionMap)
+	authHeader := fmt.Sprintf("sentry sentry_key=%s", endpoint.PublicKey)
+	if err := e.sendOTLPData(ctx, endpoint.TracesURL, data, authHeader); err != nil {
+		return fmt.Errorf("failed to send traces to Sentry: %w", err)
+	}
 
-	transactions := generateTransactions(transactionMap, orphanSpans, s.environment)
-
-	transactions = append(transactions, exceptionEvents...)
-
-	s.transport.SendEvents(transactions)
+	e.logger.Debug("Successfully sent traces to Sentry",
+		zap.Int("span_count", td.SpanCount()))
 
 	return nil
 }
 
-// generateTransactions creates a set of Sentry transactions from a transaction map and orphan spans.
-func generateTransactions(transactionMap map[sentry.SpanID]*sentry.Event, orphanSpans []*sentry.Span, environment string) []*sentry.Event {
-	transactions := make([]*sentry.Event, 0, len(transactionMap)+len(orphanSpans))
-
-	for _, t := range transactionMap {
-		transactions = append(transactions, t)
-	}
-
-	for _, orphanSpan := range orphanSpans {
-		t := transactionFromSpan(orphanSpan, environment)
-		transactions = append(transactions, t)
-	}
-
-	return transactions
+// Capabilities returns the consumer capabilities of the exporter
+func (*sentryExporter) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
 }
 
-// convertEventsToSentryExceptions creates a set of sentry events from exception events present in spans.
-// These events are stored in a mutated eventList
-func convertEventsToSentryExceptions(eventList *[]*sentry.Event, events ptrace.SpanEventSlice, sentrySpan *sentry.Span) {
-	for i := 0; i < events.Len(); i++ {
-		event := events.At(i)
-		if event.Name() != "exception" {
+// ConsumeTraces implements the traces exporter interface
+func (e *sentryExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
+	return e.pushTraceData(ctx, td)
+}
+
+// ConsumeLogs implements the logs exporter interface
+func (e *sentryExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
+	return e.pushLogData(ctx, ld)
+}
+
+// Start starts the exporter
+func (e *sentryExporter) Start(ctx context.Context, _ component.Host) error {
+	if e.config.IsDSNMode() {
+		e.logger.Info("Starting sentryexporter in DSN mode",
+			zap.String("traces_endpoint", e.dsnEndpoint.TracesURL),
+			zap.String("logs_endpoint", e.dsnEndpoint.LogsURL))
+		return nil
+	}
+
+	e.logger.Info("Starting sentryexporter in dynamic mode",
+		zap.String("org", e.config.DynamicMode.OrgSlug))
+
+	projects, err := e.sentryClient.GetAllProjects(ctx, e.config.DynamicMode.OrgSlug)
+	if err != nil {
+		e.logger.Warn("Failed to pre-populate project cache",
+			zap.Error(err))
+		return nil
+	}
+
+	for _, project := range projects {
+		if e.defaultTeamSlug == "" && len(project.Teams) > 0 {
+			e.defaultTeamSlug = project.Teams[0].Slug
+		}
+
+		endpoint, err := e.sentryClient.GetOTLPEndpoints(ctx, e.config.DynamicMode.OrgSlug, project.Slug)
+		if err != nil {
+			e.logger.Warn("Failed to fetch endpoint for project",
+				zap.String("project", project.Slug),
+				zap.Error(err))
 			continue
 		}
-		var exceptionMessage, exceptionType string
-		for k, v := range event.Attributes().All() {
-			switch k {
-			case string(conventions.ExceptionMessageKey):
-				exceptionMessage = v.Str()
-			case string(conventions.ExceptionTypeKey):
-				exceptionType = v.Str()
-			}
-		}
-		if exceptionMessage == "" && exceptionType == "" {
-			// `At least one of the following sets of attributes is required:
-			// - exception.type
-			// - exception.message`
+		e.projectToEndpoint.Store(project.Slug, endpoint)
+	}
+
+	return nil
+}
+
+// Shutdown stops the exporter
+func (e *sentryExporter) Shutdown(_ context.Context) error {
+	e.logger.Info("Shutting down sentryexporter")
+	if e.client != nil {
+		e.client.CloseIdleConnections()
+	}
+	return nil
+}
+
+func (e *sentryExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
+	if ld.LogRecordCount() == 0 {
+		return nil
+	}
+
+	if e.config.IsDSNMode() {
+		return e.sendLogsToEndpoint(ctx, ld, e.dsnEndpoint)
+	}
+
+	return e.routeLogsByProject(ctx, ld)
+}
+
+func (e *sentryExporter) routeLogsByProject(ctx context.Context, ld plog.Logs) error {
+	type projectKey struct {
+		slug     string
+		platform string
+	}
+	projectGroups := make(map[projectKey]plog.Logs)
+
+	for i := 0; i < ld.ResourceLogs().Len(); i++ {
+		rl := ld.ResourceLogs().At(i)
+		attrs := rl.Resource().Attributes()
+		projectSlug := e.extractProjectSlug(attrs)
+
+		if projectSlug == "" {
+			e.logger.Warn("Dropping logs: missing required routing attribute",
+				zap.String("attribute", e.attributeKey))
 			continue
 		}
-		sentryEvent, _ := sentryEventFromError(exceptionMessage, exceptionType, sentrySpan)
-		*eventList = append(*eventList, sentryEvent)
-	}
-}
 
-// sentryEventFromError creates a sentry event from error event in a span
-func sentryEventFromError(errorMessage, errorType string, span *sentry.Span) (*sentry.Event, error) {
-	if errorMessage == "" && errorType == "" {
-		err := errors.New("error type and error message were both empty")
-		return nil, err
-	}
-	event := sentry.NewEvent()
-	event.EventID = generateEventID()
+		platform := e.extractPlatform(attrs)
+		key := projectKey{slug: projectSlug, platform: platform}
 
-	event.Contexts["trace"] = sentry.TraceContext{
-		TraceID:      span.TraceID,
-		SpanID:       span.SpanID,
-		ParentSpanID: span.ParentSpanID,
-		Op:           span.Op,
-		Description:  span.Description,
-		Status:       span.Status,
-	}.Map()
-
-	event.Type = errorType
-	event.Message = errorMessage
-	event.Level = "error"
-	event.Exception = []sentry.Exception{{
-		Value: errorMessage,
-		Type:  errorType,
-	}}
-
-	event.Sdk.Name = otelSentryExporterName
-	event.Sdk.Version = otelSentryExporterVersion
-
-	event.StartTime = span.StartTime
-	event.Tags = span.Tags
-	event.Timestamp = span.EndTime
-	event.Transaction = span.Description
-
-	return event, nil
-}
-
-// classifyAsOrphanSpans iterates through a list of possible orphan spans and tries to associate them
-// with a transaction. As the order of the spans is not guaranteed, we have to recursively call
-// classifyAsOrphanSpans to make sure that we did not leave any spans out of the transaction they belong to.
-func classifyAsOrphanSpans(orphanSpans []*sentry.Span, prevLength int, idMap map[sentry.SpanID]sentry.SpanID, transactionMap map[sentry.SpanID]*sentry.Event) []*sentry.Span {
-	if len(orphanSpans) == 0 || len(orphanSpans) == prevLength {
-		return orphanSpans
-	}
-
-	newOrphanSpans := make([]*sentry.Span, 0, prevLength)
-
-	for _, orphanSpan := range orphanSpans {
-		if rootSpanID, ok := idMap[orphanSpan.ParentSpanID]; ok {
-			idMap[orphanSpan.SpanID] = rootSpanID
-			transactionMap[rootSpanID].Spans = append(transactionMap[rootSpanID].Spans, orphanSpan)
-		} else {
-			newOrphanSpans = append(newOrphanSpans, orphanSpan)
+		if _, exists := projectGroups[key]; !exists {
+			projectGroups[key] = plog.NewLogs()
 		}
+		rl.CopyTo(projectGroups[key].ResourceLogs().AppendEmpty())
 	}
 
-	return classifyAsOrphanSpans(newOrphanSpans, len(orphanSpans), idMap, transactionMap)
-}
-
-func convertToSentrySpan(span ptrace.Span, library pcommon.InstrumentationScope, resourceTags map[string]string) (sentrySpan *sentry.Span) {
-	attributes := span.Attributes()
-	name := span.Name()
-	spanKind := span.Kind()
-
-	op, description := generateSpanDescriptors(name, attributes, spanKind)
-	tags := generateTagsFromAttributes(attributes)
-
-	maps.Copy(tags, resourceTags)
-
-	status, message := statusFromSpanStatus(span.Status(), tags)
-
-	if message != "" {
-		tags["status_message"] = message
-	}
-
-	if spanKind != ptrace.SpanKindUnspecified {
-		tags["span_kind"] = traceutil.SpanKindStr(spanKind)
-	}
-
-	tags["library_name"] = library.Name()
-	tags["library_version"] = library.Version()
-
-	sentrySpan = &sentry.Span{
-		TraceID:     sentry.TraceID(span.TraceID()),
-		SpanID:      sentry.SpanID(span.SpanID()),
-		Description: description,
-		Op:          op,
-		Tags:        tags,
-		StartTime:   unixNanoToTime(span.StartTimestamp()),
-		EndTime:     unixNanoToTime(span.EndTimestamp()),
-		Status:      status,
-	}
-
-	if parentSpanID := span.ParentSpanID(); !parentSpanID.IsEmpty() {
-		sentrySpan.ParentSpanID = sentry.SpanID(parentSpanID)
-	}
-
-	return sentrySpan
-}
-
-// generateSpanDescriptors generates generate span descriptors (op and description)
-// from the name, attributes and SpanKind of an otel span based onSemantic Conventions
-// described by the open telemetry specification.
-//
-// See https://github.com/open-telemetry/opentelemetry-specification/tree/5b78ee1/specification/trace/semantic_conventions
-// for more details about the semantic conventions.
-func generateSpanDescriptors(name string, attrs pcommon.Map, spanKind ptrace.SpanKind) (op, description string) {
-	var opBuilder strings.Builder
-	var dBuilder strings.Builder
-
-	// Generating span descriptors operates under the assumption that only one of the conventions are present.
-	// In the possible case that multiple convention attributes are available, conventions are selected based
-	// on what is most likely and what is most useful (ex. http is prioritized over FaaS)
-
-	// If http.method exists, this is an http request span.
-	if httpMethod, ok := attrs.Get(string(conventions.HTTPMethodKey)); ok {
-		opBuilder.WriteString("http")
-
-		switch spanKind {
-		case ptrace.SpanKindClient:
-			opBuilder.WriteString(".client")
-		case ptrace.SpanKindServer:
-			opBuilder.WriteString(".server")
-		case ptrace.SpanKindUnspecified:
-		case ptrace.SpanKindInternal:
-			opBuilder.WriteString(".internal")
-		case ptrace.SpanKindProducer:
-			opBuilder.WriteString(".producer")
-		case ptrace.SpanKindConsumer:
-			opBuilder.WriteString(".consumer")
+	var errs error
+	for key, logs := range projectGroups {
+		endpoint, err := e.getOrCreateProjectEndpoint(ctx, key.slug, key.platform)
+		if err != nil {
+			e.logger.Error("Failed to get endpoint for project",
+				zap.String("project", key.slug),
+				zap.Error(err))
+			errs = errors.Join(errs, err)
+			continue
 		}
 
-		// Ex. description="GET /api/users/{user_id}".
-		fmt.Fprintf(&dBuilder, "%s %s", httpMethod.Str(), name)
-
-		return opBuilder.String(), dBuilder.String()
-	}
-
-	// If db.type exists then this is a database call span.
-	if _, ok := attrs.Get(string(conventions.DBSystemKey)); ok {
-		opBuilder.WriteString("db")
-
-		// Use DB statement (Ex "SELECT * FROM table") if possible as description.
-		if statement, okInst := attrs.Get(string(conventions.DBStatementKey)); okInst {
-			dBuilder.WriteString(statement.Str())
-		} else {
-			dBuilder.WriteString(name)
-		}
-
-		return opBuilder.String(), dBuilder.String()
-	}
-
-	// If rpc.service exists then this is a rpc call span.
-	if _, ok := attrs.Get(string(conventions.RPCServiceKey)); ok {
-		opBuilder.WriteString("rpc")
-
-		return opBuilder.String(), name
-	}
-
-	// If messaging.system exists then this is a messaging system span.
-	if _, ok := attrs.Get("messaging.system"); ok {
-		opBuilder.WriteString("message")
-
-		return opBuilder.String(), name
-	}
-
-	// If faas.trigger exists then this is a function as a service span.
-	if trigger, ok := attrs.Get("faas.trigger"); ok {
-		opBuilder.WriteString(trigger.Str())
-
-		return opBuilder.String(), name
-	}
-
-	// Default just use span.name.
-	return "", name
-}
-
-func generateTagsFromResource(resource pcommon.Resource) map[string]string {
-	return generateTagsFromAttributes(resource.Attributes())
-}
-
-func generateTagsFromAttributes(attrs pcommon.Map) map[string]string {
-	tags := make(map[string]string)
-
-	for key, attr := range attrs.All() {
-		switch attr.Type() {
-		case pcommon.ValueTypeStr:
-			tags[key] = attr.Str()
-		case pcommon.ValueTypeBool:
-			tags[key] = strconv.FormatBool(attr.Bool())
-		case pcommon.ValueTypeDouble:
-			tags[key] = strconv.FormatFloat(attr.Double(), 'g', -1, 64)
-		case pcommon.ValueTypeInt:
-			tags[key] = strconv.FormatInt(attr.Int(), 10)
-		case pcommon.ValueTypeEmpty:
-		case pcommon.ValueTypeMap:
-		case pcommon.ValueTypeSlice:
-		case pcommon.ValueTypeBytes:
-		}
-	}
-
-	return tags
-}
-
-func statusFromSpanStatus(spanStatus ptrace.Status, tags map[string]string) (status sentry.SpanStatus, message string) {
-	code := spanStatus.Code()
-	if code < 0 || int(code) > 2 {
-		return sentry.SpanStatusUnknown, fmt.Sprintf("error code %d", code)
-	}
-	httpCode, foundHTTPCode := tags["http.status_code"]
-	grpcCode, foundGrpcCode := tags["rpc.grpc.status_code"]
-	var sentryStatus sentry.SpanStatus
-	switch {
-	case code == 1 || code == 0:
-		sentryStatus = sentry.SpanStatusOK
-	case foundHTTPCode:
-		httpStatus, foundHTTPStatus := canonicalCodesHTTPMap[httpCode]
-		switch {
-		case foundHTTPStatus:
-			sentryStatus = httpStatus
-		default:
-			sentryStatus = sentry.SpanStatusUnknown
-		}
-	case foundGrpcCode:
-		grpcStatus, foundGrpcStatus := canonicalCodesGrpcMap[grpcCode]
-		switch {
-		case foundGrpcStatus:
-			sentryStatus = grpcStatus
-		default:
-			sentryStatus = sentry.SpanStatusUnknown
-		}
-	default:
-		sentryStatus = sentry.SpanStatusUnknown
-	}
-	return sentryStatus, spanStatus.Message()
-}
-
-// spanIsTransaction determines if a span should be sent to Sentry as a transaction.
-// If parent span id is empty or the span kind allows remote parent spans, then the span is a root span.
-func spanIsTransaction(s ptrace.Span) bool {
-	kind := s.Kind()
-	return s.ParentSpanID() == pcommon.SpanID{} || kind == ptrace.SpanKindServer || kind == ptrace.SpanKindConsumer
-}
-
-// transactionFromSpan converts a span to a transaction.
-func transactionFromSpan(span *sentry.Span, environment string) *sentry.Event {
-	transaction := sentry.NewEvent()
-	transaction.EventID = generateEventID()
-
-	transaction.Contexts["trace"] = sentry.TraceContext{
-		TraceID:      span.TraceID,
-		SpanID:       span.SpanID,
-		ParentSpanID: span.ParentSpanID,
-		Op:           span.Op,
-		Description:  span.Description,
-		Status:       span.Status,
-	}.Map()
-
-	transaction.Type = "transaction"
-
-	transaction.Sdk.Name = otelSentryExporterName
-	transaction.Sdk.Version = otelSentryExporterVersion
-
-	transaction.StartTime = span.StartTime
-	transaction.Tags = span.Tags
-	transaction.Timestamp = span.EndTime
-	transaction.Transaction = span.Description
-	if environment != "" {
-		transaction.Environment = environment
-	}
-
-	return transaction
-}
-
-func uuid() string {
-	id := make([]byte, 16)
-	// Prefer rand.Read over rand.Reader, see https://go-review.googlesource.com/c/go/+/272326/.
-	_, _ = rand.Read(id)
-	id[6] &= 0x0F // clear version
-	id[6] |= 0x40 // set version to 4 (random uuid)
-	id[8] &= 0x3F // clear variant
-	id[8] |= 0x80 // set to IETF variant
-	return hex.EncodeToString(id)
-}
-
-func generateEventID() sentry.EventID {
-	return sentry.EventID(uuid())
-}
-
-// createSentryExporter returns a new Sentry Exporter.
-func createSentryExporter(config *Config, set exporter.Settings) (exporter.Traces, error) {
-	transport := newSentryTransport()
-
-	clientOptions := sentry.ClientOptions{
-		Dsn:         config.DSN,
-		Environment: config.Environment,
-	}
-
-	if config.InsecureSkipVerify {
-		clientOptions.HTTPTransport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	}
-
-	transport.Configure(clientOptions)
-
-	s := &sentryExporter{
-		transport:   transport,
-		environment: config.Environment,
-	}
-
-	return exporterhelper.NewTraces(
-		context.TODO(),
-		set,
-		config,
-		s.pushTraceData,
-		exporterhelper.WithShutdown(func(ctx context.Context) error {
-			allEventsFlushed := transport.Flush(ctx)
-
-			if !allEventsFlushed {
-				set.Logger.Warn("Could not flush all events, reached timeout")
+		if err := e.sendLogsToEndpoint(ctx, logs, endpoint); err != nil {
+			var httpErr *sentryHTTPError
+			if errors.As(err, &httpErr) && (httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId")) {
+				e.logger.Warn("Project may have been deleted, invalidating cache",
+					zap.String("project", key.slug),
+					zap.Int("status_code", httpErr.statusCode))
+				e.projectToEndpoint.Delete(key.slug)
 			}
 
-			return nil
-		}),
+			e.logger.Error("Failed to send logs to project",
+				zap.String("project", key.slug),
+				zap.Error(err))
+			errs = errors.Join(errs, err)
+		}
+	}
+
+	return errs
+}
+
+func (e *sentryExporter) sendLogsToEndpoint(ctx context.Context, ld plog.Logs, endpoint *OTLPEndpoints) error {
+	request := plogotlp.NewExportRequestFromLogs(ld)
+	data, err := request.MarshalProto()
+	if err != nil {
+		return fmt.Errorf("failed to marshal logs: %w", err)
+	}
+
+	authHeader := fmt.Sprintf("sentry sentry_key=%s", endpoint.PublicKey)
+	if err := e.sendOTLPData(ctx, endpoint.LogsURL, data, authHeader); err != nil {
+		return fmt.Errorf("failed to send logs to Sentry: %w", err)
+	}
+
+	e.logger.Debug("Successfully sent logs to Sentry",
+		zap.Int("log_count", ld.LogRecordCount()))
+
+	return nil
+}
+
+// sentryHTTPError represents an HTTP error from Sentry
+type sentryHTTPError struct {
+	statusCode int
+	body       string
+}
+
+func (e *sentryHTTPError) Error() string {
+	return fmt.Sprintf("request failed with status %d: %s", e.statusCode, e.body)
+}
+
+func (e *sentryExporter) sendOTLPData(ctx context.Context, endpoint string, data []byte, authHeader string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("x-sentry-auth", authHeader)
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &sentryHTTPError{
+			statusCode: resp.StatusCode,
+			body:       string(body),
+		}
+	}
+
+	e.logger.Debug("Successfully sent data to Sentry",
+		zap.Int("status_code", resp.StatusCode),
+		zap.Int("data_size", len(data)))
+
+	return nil
+}
+
+func (e *sentryExporter) extractProjectSlug(attrs pcommon.Map) string {
+	attrValue, exists := attrs.Get(e.attributeKey)
+	if !exists {
+		return ""
+	}
+
+	serviceName := attrValue.Str()
+	if serviceName == "" {
+		return ""
+	}
+
+	if e.projectMapping != nil {
+		if mappedSlug, ok := e.projectMapping[serviceName]; ok {
+			return mappedSlug
+		}
+	}
+
+	return serviceName
+}
+
+func (*sentryExporter) extractPlatform(attrs pcommon.Map) string {
+	if lang, exists := attrs.Get("telemetry.sdk.language"); exists {
+		return lang.Str()
+	}
+	return "other"
+}
+
+func (e *sentryExporter) getOrCreateProjectEndpoint(ctx context.Context, projectSlug, platform string) (*OTLPEndpoints, error) {
+	if cached, ok := e.projectToEndpoint.Load(projectSlug); ok {
+		return cached.(*OTLPEndpoints), nil
+	}
+
+	endpoint, err := e.sentryClient.GetOTLPEndpoints(ctx, e.config.DynamicMode.OrgSlug, projectSlug)
+	if err == nil {
+		e.projectToEndpoint.Store(projectSlug, endpoint)
+		return endpoint, nil
+	}
+
+	if !e.config.DynamicMode.Routing.AutoCreateProjects {
+		return nil, fmt.Errorf("project %s not found and auto_create_projects is disabled", projectSlug)
+	}
+
+	if e.defaultTeamSlug == "" {
+		return nil, fmt.Errorf("no team available for creating project %s", projectSlug)
+	}
+
+	_, err = e.sentryClient.CreateProject(ctx, e.config.DynamicMode.OrgSlug, e.defaultTeamSlug, projectSlug, projectSlug, platform)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create project %s: %w", projectSlug, err)
+	}
+
+	endpoint, err = e.sentryClient.GetOTLPEndpoints(ctx, e.config.DynamicMode.OrgSlug, projectSlug)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get endpoints for newly created project %s: %w", projectSlug, err)
+	}
+
+	e.projectToEndpoint.Store(projectSlug, endpoint)
+	e.logger.Info("Successfully created project",
+		zap.String("project", projectSlug),
+		zap.String("team", e.defaultTeamSlug),
+		zap.String("platform", platform),
 	)
+
+	return endpoint, nil
+}
+
+// newSentryExporter creates a new Sentry OTLP proxy exporter
+func newSentryExporter(config *Config, set exporter.Settings) (*sentryExporter, error) {
+	if config.Environment != "" {
+		set.Logger.Warn(
+			"The 'environment' field is deprecated and ignored. " +
+				"Use OpenTelemetry resource attributes instead. " +
+				"Add 'deployment.environment' attribute via a resource processor.",
+		)
+	}
+
+	client := &http.Client{
+		Timeout: config.GetTimeout(),
+	}
+
+	if config.GetInsecureSkipVerify() {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.InsecureSkipVerify = true
+		client.Transport = transport
+	}
+
+	exp := &sentryExporter{
+		config: config,
+		logger: set.Logger,
+		client: client,
+	}
+
+	switch {
+	case config.IsDSNMode():
+		endpoint, err := ParseDSN(config.DSNMode.DSN)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse DSN: %w", err)
+		}
+		exp.dsnEndpoint = endpoint
+		set.Logger.Info("Configured in DSN mode", zap.String("dsn", config.DSNMode.DSN))
+
+	case config.IsDynamicMode():
+		exp.sentryClient = NewSentryClient(
+			config.DynamicMode.URL,
+			string(config.DynamicMode.AuthToken),
+			client,
+		)
+
+		exp.attributeKey = config.DynamicMode.Routing.AttributeForProject
+		if exp.attributeKey == "" {
+			exp.attributeKey = DefaultAttributeForProject
+		}
+
+		exp.projectMapping = config.DynamicMode.Routing.ProjectMapping
+		set.Logger.Info("Configured in dynamic mode",
+			zap.String("org", config.DynamicMode.OrgSlug),
+			zap.String("routing_attribute", exp.attributeKey),
+			zap.Bool("auto_create_projects", config.DynamicMode.Routing.AutoCreateProjects))
+
+	default:
+		return nil, errors.New("exporter must be configured in either DSN or dynamic mode")
+	}
+
+	return exp, nil
 }
