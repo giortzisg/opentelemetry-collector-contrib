@@ -15,7 +15,6 @@ import (
 	"sync"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -33,7 +32,9 @@ type sentryExporter struct {
 	dsnEndpoint *OTLPEndpoints
 
 	sentryClient      *SentryClient
-	projectToEndpoint sync.Map
+	projectToEndpoint map[string]*OTLPEndpoints
+	projectMapMu      sync.RWMutex
+	projectCreationMu sync.Mutex
 	attributeKey      string
 	projectMapping    map[string]string
 	defaultTeamSlug   string
@@ -93,11 +94,15 @@ func (e *sentryExporter) routeTracesByProject(ctx context.Context, td ptrace.Tra
 
 		if err := e.sendTracesToEndpoint(ctx, traces, endpoint); err != nil {
 			var httpErr *sentryHTTPError
-			if errors.As(err, &httpErr) && (httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId")) {
-				e.logger.Warn("Project may have been deleted, invalidating cache",
-					zap.String("project", key.slug),
-					zap.Int("status_code", httpErr.statusCode))
-				e.projectToEndpoint.Delete(key.slug)
+			if errors.As(err, &httpErr) {
+				if httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId") {
+					e.logger.Warn("Project may have been deleted, removing from cache",
+						zap.String("project", key.slug),
+						zap.Int("status_code", httpErr.statusCode))
+					e.projectMapMu.Lock()
+					delete(e.projectToEndpoint, key.slug)
+					e.projectMapMu.Unlock()
+				}
 			}
 
 			e.logger.Error("Failed to send traces to project",
@@ -129,21 +134,6 @@ func (e *sentryExporter) sendTracesToEndpoint(ctx context.Context, td ptrace.Tra
 	return nil
 }
 
-// Capabilities returns the consumer capabilities of the exporter
-func (*sentryExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
-}
-
-// ConsumeTraces implements the traces exporter interface
-func (e *sentryExporter) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
-	return e.pushTraceData(ctx, td)
-}
-
-// ConsumeLogs implements the logs exporter interface
-func (e *sentryExporter) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
-	return e.pushLogData(ctx, ld)
-}
-
 // Start starts the exporter
 func (e *sentryExporter) Start(ctx context.Context, _ component.Host) error {
 	if e.config.IsDSNMode() {
@@ -163,6 +153,7 @@ func (e *sentryExporter) Start(ctx context.Context, _ component.Host) error {
 		return nil
 	}
 
+	e.projectMapMu.Lock()
 	for _, project := range projects {
 		if e.defaultTeamSlug == "" && len(project.Teams) > 0 {
 			e.defaultTeamSlug = project.Teams[0].Slug
@@ -175,8 +166,9 @@ func (e *sentryExporter) Start(ctx context.Context, _ component.Host) error {
 				zap.Error(err))
 			continue
 		}
-		e.projectToEndpoint.Store(project.Slug, endpoint)
+		e.projectToEndpoint[project.Slug] = endpoint
 	}
+	e.projectMapMu.Unlock()
 
 	return nil
 }
@@ -242,11 +234,15 @@ func (e *sentryExporter) routeLogsByProject(ctx context.Context, ld plog.Logs) e
 
 		if err := e.sendLogsToEndpoint(ctx, logs, endpoint); err != nil {
 			var httpErr *sentryHTTPError
-			if errors.As(err, &httpErr) && (httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId")) {
-				e.logger.Warn("Project may have been deleted, invalidating cache",
-					zap.String("project", key.slug),
-					zap.Int("status_code", httpErr.statusCode))
-				e.projectToEndpoint.Delete(key.slug)
+			if errors.As(err, &httpErr) {
+				if httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId") {
+					e.logger.Warn("Project may have been deleted, removing from cache",
+						zap.String("project", key.slug),
+						zap.Int("status_code", httpErr.statusCode))
+					e.projectMapMu.Lock()
+					delete(e.projectToEndpoint, key.slug)
+					e.projectMapMu.Unlock()
+				}
 			}
 
 			e.logger.Error("Failed to send logs to project",
@@ -345,13 +341,18 @@ func (*sentryExporter) extractPlatform(attrs pcommon.Map) string {
 }
 
 func (e *sentryExporter) getOrCreateProjectEndpoint(ctx context.Context, projectSlug, platform string) (*OTLPEndpoints, error) {
-	if cached, ok := e.projectToEndpoint.Load(projectSlug); ok {
-		return cached.(*OTLPEndpoints), nil
+	e.projectMapMu.RLock()
+	if cached, ok := e.projectToEndpoint[projectSlug]; ok {
+		e.projectMapMu.RUnlock()
+		return cached, nil
 	}
+	e.projectMapMu.RUnlock()
 
 	endpoint, err := e.sentryClient.GetOTLPEndpoints(ctx, e.config.DynamicMode.OrgSlug, projectSlug)
 	if err == nil {
-		e.projectToEndpoint.Store(projectSlug, endpoint)
+		e.projectMapMu.Lock()
+		e.projectToEndpoint[projectSlug] = endpoint
+		e.projectMapMu.Unlock()
 		return endpoint, nil
 	}
 
@@ -363,6 +364,9 @@ func (e *sentryExporter) getOrCreateProjectEndpoint(ctx context.Context, project
 		return nil, fmt.Errorf("no team available for creating project %s", projectSlug)
 	}
 
+	e.projectCreationMu.Lock()
+	defer e.projectCreationMu.Unlock()
+
 	_, err = e.sentryClient.CreateProject(ctx, e.config.DynamicMode.OrgSlug, e.defaultTeamSlug, projectSlug, projectSlug, platform)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project %s: %w", projectSlug, err)
@@ -373,7 +377,10 @@ func (e *sentryExporter) getOrCreateProjectEndpoint(ctx context.Context, project
 		return nil, fmt.Errorf("failed to get endpoints for newly created project %s: %w", projectSlug, err)
 	}
 
-	e.projectToEndpoint.Store(projectSlug, endpoint)
+	e.projectMapMu.Lock()
+	e.projectToEndpoint[projectSlug] = endpoint
+	e.projectMapMu.Unlock()
+
 	e.logger.Info("Successfully created project",
 		zap.String("project", projectSlug),
 		zap.String("team", e.defaultTeamSlug),
@@ -407,9 +414,10 @@ func newSentryExporter(config *Config, set exporter.Settings) (*sentryExporter, 
 	}
 
 	exp := &sentryExporter{
-		config: config,
-		logger: set.Logger,
-		client: client,
+		config:            config,
+		logger:            set.Logger,
+		client:            client,
+		projectToEndpoint: make(map[string]*OTLPEndpoints),
 	}
 
 	switch {
