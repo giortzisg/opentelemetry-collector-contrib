@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/sharedcomponent"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
-
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sentryexporter/internal/metadata"
+	"go.opentelemetry.io/collector/exporter/exporterhelper"
 )
 
 // NewFactory creates a factory for Sentry exporter.
@@ -36,29 +38,61 @@ func createDefaultConfig() component.Config {
 }
 
 func createTracesExporter(
-	_ context.Context,
-	params exporter.Settings,
+	ctx context.Context,
+	set exporter.Settings,
 	config component.Config,
 ) (exporter.Traces, error) {
-	sentryConfig, ok := config.(*Config)
-	if !ok {
-		return nil, fmt.Errorf("unexpected config type: %T", config)
+	sc, se, err := getOrCreateSentryExporter(config, set)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create exporter based on sentry config.
-	return newSentryExporter(sentryConfig, params)
+	return exporterhelper.NewTraces(
+		ctx,
+		set,
+		config,
+		se.pushTraceData,
+		exporterhelper.WithStart(sc.Start),
+		exporterhelper.WithShutdown(sc.Shutdown),
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
+	)
 }
 
 func createLogsExporter(
-	_ context.Context,
+	ctx context.Context,
 	set exporter.Settings,
 	config component.Config,
 ) (exporter.Logs, error) {
-	sentryConfig, ok := config.(*Config)
-	if !ok {
-		return nil, fmt.Errorf("unexpected config type: %T", config)
+	sc, se, err := getOrCreateSentryExporter(config, set)
+	if err != nil {
+		return nil, err
 	}
-
-	// Create exporter based on sentry config.
-	return newSentryExporter(sentryConfig, set)
+	return exporterhelper.NewLogs(
+		ctx,
+		set,
+		config,
+		se.pushLogData,
+		exporterhelper.WithStart(sc.Start),
+		exporterhelper.WithShutdown(sc.Shutdown),
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
+	)
 }
+
+// getOrCreateSentryExporter creates a sentryExporter and caches it for a particular configuration.
+func getOrCreateSentryExporter(cfg component.Config, set exporter.Settings) (*sharedcomponent.SharedComponent, *sentryExporter, error) {
+	sc := exporters.GetOrAdd(cfg, func() component.Component {
+		sentryConfig := cfg.(*Config)
+		se, err := newSentryExporter(sentryConfig, set)
+		if err != nil {
+			return nil
+		}
+		return se
+	})
+
+	unwrapped := sc.Unwrap()
+	if unwrapped == nil {
+		return nil, nil, fmt.Errorf("failed to create sentry exporter")
+	}
+	return sc, unwrapped.(*sentryExporter), nil
+}
+
+var exporters = sharedcomponent.NewSharedComponents()
