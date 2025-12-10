@@ -96,12 +96,30 @@ func (e *sentryExporter) routeTracesByProject(ctx context.Context, td ptrace.Tra
 			var httpErr *sentryHTTPError
 			if errors.As(err, &httpErr) {
 				if httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId") {
-					e.logger.Warn("Project may have been deleted, removing from cache",
+					e.logger.Warn("Project may have been deleted, removing from cache and retrying",
 						zap.String("project", key.slug),
 						zap.Int("status_code", httpErr.statusCode))
 					e.projectMapMu.Lock()
 					delete(e.projectToEndpoint, key.slug)
 					e.projectMapMu.Unlock()
+
+					newEndpoint, retryErr := e.getOrCreateProjectEndpoint(ctx, key.slug, key.platform)
+					if retryErr != nil {
+						e.logger.Error("Failed to get endpoint for project on retry",
+							zap.String("project", key.slug),
+							zap.Error(retryErr))
+						errs = errors.Join(errs, retryErr)
+						continue
+					}
+
+					if retryErr := e.sendTracesToEndpoint(ctx, traces, newEndpoint); retryErr != nil {
+						e.logger.Error("Failed to send traces to project on retry",
+							zap.String("project", key.slug),
+							zap.Error(retryErr))
+						errs = errors.Join(errs, retryErr)
+						continue
+					}
+					continue
 				}
 			}
 
@@ -236,12 +254,30 @@ func (e *sentryExporter) routeLogsByProject(ctx context.Context, ld plog.Logs) e
 			var httpErr *sentryHTTPError
 			if errors.As(err, &httpErr) {
 				if httpErr.statusCode == http.StatusForbidden && strings.Contains(httpErr.body, "event submission rejected with_reason: ProjectId") {
-					e.logger.Warn("Project may have been deleted, removing from cache",
+					e.logger.Warn("Project may have been deleted, removing from cache and retrying",
 						zap.String("project", key.slug),
 						zap.Int("status_code", httpErr.statusCode))
 					e.projectMapMu.Lock()
 					delete(e.projectToEndpoint, key.slug)
 					e.projectMapMu.Unlock()
+
+					newEndpoint, retryErr := e.getOrCreateProjectEndpoint(ctx, key.slug, key.platform)
+					if retryErr != nil {
+						e.logger.Error("Failed to get endpoint for project on retry",
+							zap.String("project", key.slug),
+							zap.Error(retryErr))
+						errs = errors.Join(errs, retryErr)
+						continue
+					}
+
+					if retryErr := e.sendLogsToEndpoint(ctx, logs, newEndpoint); retryErr != nil {
+						e.logger.Error("Failed to send logs to project on retry",
+							zap.String("project", key.slug),
+							zap.Error(retryErr))
+						errs = errors.Join(errs, retryErr)
+						continue
+					}
+					continue
 				}
 			}
 
