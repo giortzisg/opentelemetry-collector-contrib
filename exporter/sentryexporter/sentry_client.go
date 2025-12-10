@@ -14,6 +14,14 @@ import (
 	"github.com/getsentry/sentry-go"
 )
 
+// SentryAPIClient defines the interface for interacting with Sentry API
+type SentryAPIClient interface {
+	GetAllProjects(ctx context.Context, orgSlug string) ([]ProjectInfo, error)
+	GetProjectKeys(ctx context.Context, orgSlug, projectSlug string) ([]ProjectKey, error)
+	GetOTLPEndpoints(ctx context.Context, orgSlug, projectSlug string) (*OTLPEndpoints, error)
+	CreateProject(ctx context.Context, orgSlug, teamSlug, projectSlug, projectName, platform string) (*ProjectInfo, error)
+}
+
 // SentryClient handles communication with the Sentry API
 type SentryClient struct {
 	baseURL   string

@@ -31,7 +31,7 @@ type sentryExporter struct {
 
 	dsnEndpoint *OTLPEndpoints
 
-	sentryClient      *SentryClient
+	sentryClient      SentryAPIClient
 	projectToEndpoint map[string]*OTLPEndpoints
 	projectMapMu      sync.RWMutex
 	projectCreationMu sync.Mutex

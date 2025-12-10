@@ -10,14 +10,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/exporter/exportertest"
-	"go.opentelemetry.io/collector/pdata/plog"
-	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/testdata"
 )
 
-func TestPareDSN(t *testing.T) {
+func TestParseDSN(t *testing.T) {
 	tests := []struct {
 		name        string
 		dsn         string
@@ -73,222 +74,535 @@ func TestPareDSN(t *testing.T) {
 	}
 }
 
-func TestSharedComponentSingleton(t *testing.T) {
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
+func TestExporterDataFlow(t *testing.T) {
+	type testCase struct {
+		name string
+
+		config *Config
+
+		serverHandler    func(*testing.T, *int, *int) http.HandlerFunc
+		setupMocks       func(*mockSentryClient)
+		prePopulateCache func(*sentryExporter, string)
+		setupOnStart     func(*sentryExporter) error
+
+		resourceAttributes map[string]string
+
+		expectedTraceRequests int
+		expectedLogRequests   int
+		expectedError         bool
+
+		assertExpectations func(*testing.T, *sentryExporter, *mockSentryClient)
+	}
+
+	tests := []testCase{
+		{
+			name: "dsn_mode_success",
+			config: &Config{
+				DSNMode: &DSNModeConfig{
+					DSN: "http://public_key@localhost/7654321",
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/traces" {
+						*traceReqs++
+					} else if r.URL.Path == "/logs" {
+						*logReqs++
+					}
+					w.WriteHeader(http.StatusOK)
+				}
+			},
+			setupMocks: nil,
+			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
+				exp.dsnEndpoint.TracesURL = "http://" + testServerAddr + "/traces"
+				exp.dsnEndpoint.LogsURL = "http://" + testServerAddr + "/logs"
+			},
+			setupOnStart:          nil,
+			resourceAttributes:    nil,
+			expectedTraceRequests: 1,
+			expectedLogRequests:   1,
+			expectedError:         false,
 		},
-	}
-
-	factory := NewFactory()
-	set := exportertest.NewNopSettings(factory.Type())
-
-	tracesExp, err := factory.CreateTraces(context.Background(), set, cfg)
-	require.NoError(t, err)
-	require.NotNil(t, tracesExp)
-	logsExp, err := factory.CreateLogs(context.Background(), set, cfg)
-	require.NoError(t, err)
-	require.NotNil(t, logsExp)
-
-	sc1, se1, err := getOrCreateSentryExporter(cfg, set)
-	require.NoError(t, err)
-	sc2, se2, err := getOrCreateSentryExporter(cfg, set)
-	require.NoError(t, err)
-
-	assert.Same(t, sc1, sc2, "SharedComponents should be the same instance")
-	assert.Same(t, se1, se2, "Unwrapped exporters should be the same instance")
-
-	err = tracesExp.Start(context.Background(), componenttest.NewNopHost())
-	require.NoError(t, err)
-	err = logsExp.Start(context.Background(), componenttest.NewNopHost())
-	require.NoError(t, err)
-	err = tracesExp.Shutdown(context.Background())
-	require.NoError(t, err)
-	err = logsExp.Shutdown(context.Background())
-	require.NoError(t, err)
-}
-
-func TestSharedComponentDifferentConfigs(t *testing.T) {
-	cfg1 := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key1@o123456.ingest.sentry.io/7654321",
+		{
+			name: "dynamic_mode_cached_project",
+			config: &Config{
+				DynamicMode: &DynamicModeConfig{
+					OrgSlug:   "test-org",
+					AuthToken: "test-token",
+					URL:       "https://sentry.io",
+					Routing: RoutingConfig{
+						AttributeForProject: "service.name",
+					},
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/traces" {
+						*traceReqs++
+					} else if r.URL.Path == "/logs" {
+						*logReqs++
+					}
+					w.WriteHeader(http.StatusOK)
+				}
+			},
+			setupMocks: func(mc *mockSentryClient) {
+				mc.On("GetAllProjects", mock.Anything, "test-org").
+					Return([]ProjectInfo{}, nil)
+			},
+			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
+				exp.projectToEndpoint["my-service"] = &OTLPEndpoints{
+					TracesURL: "http://" + testServerAddr + "/traces",
+					LogsURL:   "http://" + testServerAddr + "/logs",
+					PublicKey: "test-key",
+				}
+			},
+			resourceAttributes: map[string]string{
+				"service.name": "my-service",
+			},
+			expectedTraceRequests: 1,
+			expectedLogRequests:   1,
+			expectedError:         false,
+			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+				mc.AssertNotCalled(t, "CreateProject")
+			},
 		},
-	}
-
-	cfg2 := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key2@o123456.ingest.sentry.io/7654321",
+		{
+			name: "dynamic_mode_project_creation",
+			config: &Config{
+				DynamicMode: &DynamicModeConfig{
+					OrgSlug:   "test-org",
+					AuthToken: "test-token",
+					URL:       "https://sentry.io",
+					Routing: RoutingConfig{
+						AttributeForProject: "service.name",
+						AutoCreateProjects:  true,
+					},
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/traces" {
+						*traceReqs++
+					} else if r.URL.Path == "/logs" {
+						*logReqs++
+					}
+					w.WriteHeader(http.StatusOK)
+				}
+			},
+			setupMocks: func(mc *mockSentryClient) {
+				mc.On("GetAllProjects", mock.Anything, "test-org").
+					Return([]ProjectInfo{}, nil)
+			},
+			prePopulateCache: nil,
+			setupOnStart: func(exp *sentryExporter) error {
+				exp.defaultTeamSlug = "test-team"
+				return nil
+			},
+			resourceAttributes: map[string]string{
+				"service.name":           "new-service",
+				"telemetry.sdk.language": "python",
+			},
+			expectedTraceRequests: 1,
+			expectedLogRequests:   1,
+			expectedError:         false,
+			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+				mc.AssertCalled(t, "GetOTLPEndpoints", mock.Anything, "test-org", "new-service")
+				mc.AssertCalled(t, "CreateProject", mock.Anything, "test-org", "test-team", "new-service", "new-service", "python")
+				assert.Len(t, exp.projectToEndpoint, 1, "Should have cached the new project")
+			},
 		},
-	}
-
-	factory := NewFactory()
-	set := exportertest.NewNopSettings(factory.Type())
-	exp1, err := factory.CreateTraces(context.Background(), set, cfg1)
-	require.NoError(t, err)
-	exp2, err := factory.CreateTraces(context.Background(), set, cfg2)
-	require.NoError(t, err)
-
-	_, se1, err := getOrCreateSentryExporter(cfg1, set)
-	require.NoError(t, err)
-	_, se2, err := getOrCreateSentryExporter(cfg2, set)
-	require.NoError(t, err)
-
-	assert.NotSame(t, se1, se2, "Different configs should create different exporter instances")
-	err = exp1.Shutdown(context.Background())
-	require.NoError(t, err)
-	err = exp2.Shutdown(context.Background())
-	require.NoError(t, err)
-}
-
-func TestPushTraceData(t *testing.T) {
-	factory := NewFactory()
-	requestReceived := false
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestReceived = true
-		assert.Equal(t, "POST", r.Method)
-		assert.Contains(t, r.Header.Get("x-sentry-auth"), "sentry sentry_key=")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer testServer.Close()
-
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@" + testServer.Listener.Addr().String() + "/7654321",
+		{
+			name: "dynamic_mode_missing_routing_attribute",
+			config: &Config{
+				DynamicMode: &DynamicModeConfig{
+					OrgSlug:   "test-org",
+					AuthToken: "test-token",
+					URL:       "https://sentry.io",
+					Routing: RoutingConfig{
+						AttributeForProject: "service.name",
+					},
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					t.Fatalf("Should not make HTTP request when routing attribute is missing")
+				}
+			},
+			setupMocks: func(mc *mockSentryClient) {
+				mc.On("GetAllProjects", mock.Anything, "test-org").
+					Return([]ProjectInfo{}, nil)
+			},
+			prePopulateCache:      nil,
+			resourceAttributes:    nil,
+			expectedTraceRequests: 0,
+			expectedLogRequests:   0,
+			expectedError:         false,
+			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+				mc.AssertNotCalled(t, "GetOTLPEndpoints")
+				mc.AssertNotCalled(t, "CreateProject")
+			},
 		},
-	}
-
-	set := exportertest.NewNopSettings(factory.Type())
-	exp, err := newSentryExporter(cfg, set)
-	require.NoError(t, err)
-	exp.dsnEndpoint.TracesURL = testServer.URL
-
-	traces := ptrace.NewTraces()
-	rs := traces.ResourceSpans().AppendEmpty()
-	ss := rs.ScopeSpans().AppendEmpty()
-	span := ss.Spans().AppendEmpty()
-	span.SetName("test-span")
-	span.SetTraceID([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
-	span.SetSpanID([8]byte{1, 2, 3, 4, 5, 6, 7, 8})
-
-	err = exp.pushTraceData(context.Background(), traces)
-	assert.NoError(t, err)
-	assert.True(t, requestReceived, "Expected test server to receive request")
-}
-
-func TestPushLogData(t *testing.T) {
-	factory := NewFactory()
-	requestReceived := false
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestReceived = true
-		assert.Equal(t, "POST", r.Method)
-		assert.Contains(t, r.Header.Get("x-sentry-auth"), "sentry sentry_key=")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer testServer.Close()
-
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@" + testServer.Listener.Addr().String() + "/7654321",
+		{
+			name: "dynamic_mode_cache_invalidation_403",
+			config: &Config{
+				DynamicMode: &DynamicModeConfig{
+					OrgSlug:   "test-org",
+					AuthToken: "test-token",
+					URL:       "https://sentry.io",
+					Routing: RoutingConfig{
+						AttributeForProject: "service.name",
+						AutoCreateProjects:  false,
+					},
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"detail":"event submission rejected with_reason: ProjectId is invalid"}`))
+				}
+			},
+			setupMocks: func(mc *mockSentryClient) {
+				mc.On("GetAllProjects", mock.Anything, "test-org").
+					Return([]ProjectInfo{}, nil)
+				mc.On("GetOTLPEndpoints", mock.Anything, "test-org", "test-service").
+					Return((*OTLPEndpoints)(nil), assert.AnError)
+			},
+			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
+				exp.projectToEndpoint["test-service"] = &OTLPEndpoints{
+					TracesURL: "http://" + testServerAddr + "/traces",
+					LogsURL:   "http://" + testServerAddr + "/logs",
+					PublicKey: "test-key",
+				}
+			},
+			resourceAttributes: map[string]string{
+				"service.name": "test-service",
+			},
+			expectedTraceRequests: 0,
+			expectedLogRequests:   0,
+			expectedError:         true,
+			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+				_, exists := exp.projectToEndpoint["test-service"]
+				assert.False(t, exists, "Cache should be invalidated after 403")
+			},
 		},
-	}
-
-	set := exportertest.NewNopSettings(factory.Type())
-	exp, err := newSentryExporter(cfg, set)
-	require.NoError(t, err)
-
-	exp.dsnEndpoint.LogsURL = testServer.URL
-
-	logs := plog.NewLogs()
-	rl := logs.ResourceLogs().AppendEmpty()
-	sl := rl.ScopeLogs().AppendEmpty()
-	logRecord := sl.LogRecords().AppendEmpty()
-	logRecord.Body().SetStr("test log message")
-
-	err = exp.pushLogData(context.Background(), logs)
-	assert.NoError(t, err)
-	assert.True(t, requestReceived, "Expected test server to receive request")
-}
-
-func TestPushTraceDataEmpty(t *testing.T) {
-	factory := NewFactory()
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-		},
-	}
-
-	set := exportertest.NewNopSettings(factory.Type())
-	exp, err := newSentryExporter(cfg, set)
-	require.NoError(t, err)
-
-	traces := ptrace.NewTraces()
-	err = exp.pushTraceData(context.Background(), traces)
-	assert.NoError(t, err)
-}
-
-func TestPushLogDataEmpty(t *testing.T) {
-	factory := NewFactory()
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-		},
-	}
-
-	set := exportertest.NewNopSettings(factory.Type())
-	exp, err := newSentryExporter(cfg, set)
-	require.NoError(t, err)
-
-	logs := plog.NewLogs()
-	err = exp.pushLogData(context.Background(), logs)
-	assert.NoError(t, err)
-}
-
-func TestCacheInvalidationOn403(t *testing.T) {
-	factory := NewFactory()
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"detail":"event submission rejected with_reason: ProjectId is invalid"}`))
-	}))
-	defer testServer.Close()
-
-	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@" + testServer.Listener.Addr().String() + "/7654321",
-		},
-	}
-
-	set := exportertest.NewNopSettings(factory.Type())
-	exp, err := newSentryExporter(cfg, set)
-	require.NoError(t, err)
-
-	projectSlug := "test-project"
-	endpoint := &OTLPEndpoints{
-		LogsURL:   testServer.URL,
-		TracesURL: testServer.URL,
-		PublicKey: "test-key",
-	}
-	exp.projectToEndpoint[projectSlug] = endpoint
-
-	logs := plog.NewLogs()
-	rl := logs.ResourceLogs().AppendEmpty()
-	rl.Resource().Attributes().PutStr("service.name", projectSlug)
-	sl := rl.ScopeLogs().AppendEmpty()
-	logRecord := sl.LogRecords().AppendEmpty()
-	logRecord.Body().SetStr("test log")
-
-	exp.config = &Config{
-		DynamicMode: &DynamicModeConfig{
-			OrgSlug: "test-org",
-			Routing: RoutingConfig{
-				AttributeForProject: "service.name",
+		{
+			name: "dynamic_mode_500_error_keeps_cache",
+			config: &Config{
+				DynamicMode: &DynamicModeConfig{
+					OrgSlug:   "test-org",
+					AuthToken: "test-token",
+					URL:       "https://sentry.io",
+					Routing: RoutingConfig{
+						AttributeForProject: "service.name",
+					},
+				},
+			},
+			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte("Internal Server Error"))
+				}
+			},
+			setupMocks: func(mc *mockSentryClient) {
+				mc.On("GetAllProjects", mock.Anything, "test-org").
+					Return([]ProjectInfo{}, nil)
+			},
+			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
+				exp.projectToEndpoint["test-service"] = &OTLPEndpoints{
+					TracesURL: "http://" + testServerAddr + "/traces",
+					LogsURL:   "http://" + testServerAddr + "/logs",
+					PublicKey: "test-key",
+				}
+			},
+			resourceAttributes: map[string]string{
+				"service.name": "test-service",
+			},
+			expectedTraceRequests: 0,
+			expectedLogRequests:   0,
+			expectedError:         true,
+			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+				_, exists := exp.projectToEndpoint["test-service"]
+				assert.True(t, exists, "Cache should NOT be invalidated on 500 errors")
 			},
 		},
 	}
-	exp.attributeKey = "service.name"
 
-	err = exp.routeLogsByProject(context.Background(), logs)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "403")
-	_, exists := exp.projectToEndpoint[projectSlug]
-	assert.False(t, exists, "Cache entry should be invalidated after 403")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var traceRequests, logRequests int
+
+			handler := tt.serverHandler(t, &traceRequests, &logRequests)
+			testServer := httptest.NewServer(handler)
+			defer testServer.Close()
+
+			set := exportertest.NewNopSettings(NewFactory().Type())
+			exp, err := newSentryExporter(tt.config, set)
+			require.NoError(t, err)
+
+			var mockClient *mockSentryClient
+			if tt.config.IsDynamicMode() {
+				mockClient = &mockSentryClient{}
+				exp.sentryClient = mockClient
+				if tt.setupMocks != nil {
+					tt.setupMocks(mockClient)
+				}
+			}
+
+			if tt.prePopulateCache != nil {
+				tt.prePopulateCache(exp, testServer.Listener.Addr().String())
+			}
+
+			if tt.setupOnStart != nil {
+				err = tt.setupOnStart(exp)
+				require.NoError(t, err)
+			}
+
+			err = exp.Start(context.Background(), componenttest.NewNopHost())
+			require.NoError(t, err)
+			defer func() {
+				err = exp.Shutdown(context.Background())
+				require.NoError(t, err)
+			}()
+
+			if tt.config.IsDynamicMode() && tt.prePopulateCache == nil && tt.resourceAttributes != nil {
+				endpoint := &OTLPEndpoints{
+					TracesURL: "http://" + testServer.Listener.Addr().String() + "/traces",
+					LogsURL:   "http://" + testServer.Listener.Addr().String() + "/logs",
+					PublicKey: "new-key",
+				}
+
+				mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", mock.Anything).
+					Return((*OTLPEndpoints)(nil), assert.AnError).Once()
+
+				mockClient.On("CreateProject", mock.Anything, "test-org", "test-team", mock.Anything, mock.Anything, mock.Anything).
+					Return(&ProjectInfo{}, nil).Once()
+
+				mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", mock.Anything).
+					Return(endpoint, nil).Once()
+			}
+
+			traces := testdata.GenerateTracesTwoSpansSameResource()
+			for k, v := range tt.resourceAttributes {
+				traces.ResourceSpans().At(0).Resource().Attributes().PutStr(k, v)
+			}
+			err = exp.pushTraceData(context.Background(), traces)
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			logs := testdata.GenerateLogsTwoLogRecordsSameResource()
+			for k, v := range tt.resourceAttributes {
+				logs.ResourceLogs().At(0).Resource().Attributes().PutStr(k, v)
+			}
+			err = exp.pushLogData(context.Background(), logs)
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, tt.expectedTraceRequests, traceRequests)
+			assert.Equal(t, tt.expectedLogRequests, logRequests)
+
+			if tt.assertExpectations != nil {
+				tt.assertExpectations(t, exp, mockClient)
+			}
+
+			if mockClient != nil {
+				mockClient.AssertExpectations(t)
+			}
+		})
+	}
+}
+
+func TestStartPrePopulatesCache(t *testing.T) {
+	t.Run("loads_existing_projects", func(t *testing.T) {
+		cfg := &Config{
+			DynamicMode: &DynamicModeConfig{
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+			},
+		}
+
+		set := exportertest.NewNopSettings(NewFactory().Type())
+		exp, err := newSentryExporter(cfg, set)
+		require.NoError(t, err)
+
+		mockClient := &mockSentryClient{}
+		exp.sentryClient = mockClient
+
+		projects := []ProjectInfo{
+			{Slug: "project1", Teams: []TeamInfo{{Slug: "team1"}}},
+			{Slug: "project2", Teams: []TeamInfo{{Slug: "team1"}}},
+		}
+
+		endpoint1 := &OTLPEndpoints{
+			TracesURL: "https://example.com/project1/traces",
+			LogsURL:   "https://example.com/project1/logs",
+			PublicKey: "key1",
+		}
+
+		endpoint2 := &OTLPEndpoints{
+			TracesURL: "https://example.com/project2/traces",
+			LogsURL:   "https://example.com/project2/logs",
+			PublicKey: "key2",
+		}
+
+		mockClient.On("GetAllProjects", mock.Anything, "test-org").
+			Return(projects, nil)
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project1").
+			Return(endpoint1, nil)
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
+			Return(endpoint2, nil)
+
+		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		require.NoError(t, err)
+
+		assert.Len(t, exp.projectToEndpoint, 2)
+		assert.Equal(t, endpoint1, exp.projectToEndpoint["project1"])
+		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
+		assert.Equal(t, "team1", exp.defaultTeamSlug)
+
+		mockClient.AssertExpectations(t)
+	})
+}
+
+func TestGetOrCreateProjectEndpoint(t *testing.T) {
+	t.Run("project_exists_in_cache", func(t *testing.T) {
+		cfg := &Config{
+			DynamicMode: &DynamicModeConfig{
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+			},
+		}
+
+		set := exportertest.NewNopSettings(NewFactory().Type())
+		exp, err := newSentryExporter(cfg, set)
+		require.NoError(t, err)
+
+		mockClient := &mockSentryClient{}
+		exp.sentryClient = mockClient
+
+		projects := []ProjectInfo{
+			{
+				Slug: "project1",
+				Teams: []TeamInfo{
+					{Slug: "team1"},
+				},
+			},
+			{
+				Slug: "project2",
+				Teams: []TeamInfo{
+					{Slug: "team1"},
+				},
+			},
+		}
+
+		endpoint1 := &OTLPEndpoints{
+			TracesURL: "https://example.com/project1/traces",
+			LogsURL:   "https://example.com/project1/logs",
+			PublicKey: "key1",
+		}
+
+		endpoint2 := &OTLPEndpoints{
+			TracesURL: "https://example.com/project2/traces",
+			LogsURL:   "https://example.com/project2/logs",
+			PublicKey: "key2",
+		}
+
+		mockClient.On("GetAllProjects", mock.Anything, "test-org").
+			Return(projects, nil)
+
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project1").
+			Return(endpoint1, nil)
+
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
+			Return(endpoint2, nil)
+
+		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		require.NoError(t, err)
+
+		assert.Len(t, exp.projectToEndpoint, 2, "Should have cached 2 projects")
+		assert.Equal(t, endpoint1, exp.projectToEndpoint["project1"])
+		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
+		assert.Equal(t, "team1", exp.defaultTeamSlug, "Should set default team")
+
+		mockClient.AssertExpectations(t)
+	})
+
+	t.Run("handles_get_all_projects_error", func(t *testing.T) {
+		cfg := &Config{
+			DynamicMode: &DynamicModeConfig{
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+			},
+		}
+
+		set := exportertest.NewNopSettings(NewFactory().Type())
+		exp, err := newSentryExporter(cfg, set)
+		require.NoError(t, err)
+
+		mockClient := &mockSentryClient{}
+		exp.sentryClient = mockClient
+
+		mockClient.On("GetAllProjects", mock.Anything, "test-org").
+			Return(([]ProjectInfo)(nil), assert.AnError)
+
+		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		require.NoError(t, err, "Should not fail on pre-population error")
+
+		assert.Empty(t, exp.projectToEndpoint, "Cache should be empty")
+
+		mockClient.AssertExpectations(t)
+	})
+
+	t.Run("continues_on_endpoint_fetch_error", func(t *testing.T) {
+		cfg := &Config{
+			DynamicMode: &DynamicModeConfig{
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+			},
+		}
+
+		set := exportertest.NewNopSettings(NewFactory().Type())
+		exp, err := newSentryExporter(cfg, set)
+		require.NoError(t, err)
+
+		mockClient := &mockSentryClient{}
+		exp.sentryClient = mockClient
+
+		projects := []ProjectInfo{
+			{Slug: "project1", Teams: []TeamInfo{{Slug: "team1"}}},
+			{Slug: "project2", Teams: []TeamInfo{{Slug: "team1"}}},
+		}
+
+		endpoint2 := &OTLPEndpoints{
+			TracesURL: "https://example.com/project2/traces",
+			LogsURL:   "https://example.com/project2/logs",
+			PublicKey: "key2",
+		}
+
+		mockClient.On("GetAllProjects", mock.Anything, "test-org").
+			Return(projects, nil)
+
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project1").
+			Return((*OTLPEndpoints)(nil), assert.AnError)
+
+		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
+			Return(endpoint2, nil)
+
+		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		require.NoError(t, err)
+
+		assert.Len(t, exp.projectToEndpoint, 1, "Should have cached 1 project (skipped the error)")
+		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
+
+		mockClient.AssertExpectations(t)
+	})
 }
