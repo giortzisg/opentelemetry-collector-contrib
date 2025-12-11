@@ -403,6 +403,15 @@ func (e *sentryExporter) getOrCreateProjectEndpoint(ctx context.Context, project
 	e.projectCreationMu.Lock()
 	defer e.projectCreationMu.Unlock()
 
+	// in case where two goroutines try to create the same project, the first one that acquires the projectCreationMu lock
+	// will also create and load the project in the cache. We then need to double-check the cache for the project
+	e.projectMapMu.RLock()
+	if cached, ok := e.projectToEndpoint[projectSlug]; ok {
+		e.projectMapMu.RUnlock()
+		return cached, nil
+	}
+	e.projectMapMu.RUnlock()
+
 	_, err = e.sentryClient.CreateProject(ctx, e.config.DynamicMode.OrgSlug, e.defaultTeamSlug, projectSlug, projectSlug, platform)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project %s: %w", projectSlug, err)
