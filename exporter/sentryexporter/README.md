@@ -17,20 +17,35 @@ The Sentry Exporter allows you to send traces to [Sentry](https://sentry.io/).
 
 For more details about distributed tracing in Sentry, please view [our documentation](https://docs.sentry.io/performance-monitoring/distributed-tracing/).
 
-The following configuration options are supported:
+The exporter now operates only in dynamic mode. The following configuration options are supported:
 
-- `dsn`: The DSN tells the exporter where to send the events. You can find a Sentry project DSN in the “Client Keys” section of the “Project Settings” section of a Sentry project.
-- `environment`: When the value is set, it will set the event environment tag, so the event can be filtered accordingly in Sentry. Note that this applies to every single event that is processed by the Sentry Exporter.
-- `insecure_skip_verify`: If it is set to true, then ssl certificates will not be checked. Useful for test purposes, as well as for Sentry installations deployed in private clouds.
+- `url`: Base URL for the Sentry organization (required).
+- `org_slug`: Target organization slug (required).
+- `auth_token`: Authentication token with access to Sentry APIs (required).
+- `routing`: Controls how telemetry is mapped to projects.
+  - `attribute_for_project`: Resource attribute to use for routing (defaults to `service.name`).
+  - `project_mapping`: Optional mapping from attribute value to project slug.
+  - `auto_create_projects`: Automatically create projects when missing.
+- `timeout`: HTTP timeout (defaults to 30s).
+- `insecure_skip_verify`: Skip TLS verification (for testing only).
+- `environment` (deprecated): Use resource attribute `deployment.environment` instead.
 
 Example:
 
 ```yaml
 exporters:
   sentry:
-    dsn: https://key@host/path/42
-    environment: prod
-    insecure_skip_verify: true
+    url: https://sentry.io
+    org_slug: my-org
+    auth_token: ${SENTRY_AUTH_TOKEN}
+    routing:
+      auto_create_projects: true
+      attribute_for_project: service.name
+      project_mapping:
+        api-service: backend-api
+        web-service: frontend-web
+    timeout: 30s
+    insecure_skip_verify: false
 ```
 
 See the [docs](./docs/transformation.md) for more details on how this transformation is working.

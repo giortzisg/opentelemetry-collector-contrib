@@ -12,5 +12,6 @@ status:
 tests:
   expect_consumer_error: true
   config:
-    dsn_mode:
-      dsn: https://key@host/path/42
+    url: https://sentry.io
+    org_slug: example-org
+    auth_token: test-token

@@ -19,62 +19,6 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/testdata"
 )
 
-func TestParseDSN(t *testing.T) {
-	tests := []struct {
-		name        string
-		dsn         string
-		expectError bool
-		publicKey   string
-		projectID   string
-	}{
-		{
-			name:        "valid DSN",
-			dsn:         "https://public_key@o123456.ingest.sentry.io/7654321",
-			expectError: false,
-			publicKey:   "public_key",
-			projectID:   "7654321",
-		},
-		{
-			name:        "DSN with path",
-			dsn:         "https://key@sentry.example.com/path/12345",
-			expectError: false,
-			publicKey:   "key",
-			projectID:   "12345",
-		},
-		{
-			name:        "invalid DSN",
-			dsn:         "://invalid",
-			expectError: true,
-		},
-		{
-			name:        "DSN without public key",
-			dsn:         "https://sentry.io/12345",
-			expectError: true,
-		},
-		{
-			name:        "DSN without project ID",
-			dsn:         "https://key@sentry.io",
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			endpoints, err := ParseDSN(tt.dsn)
-			if tt.expectError {
-				assert.Error(t, err)
-				return
-			}
-
-			require.NoError(t, err)
-			assert.NotNil(t, endpoints)
-			assert.Equal(t, tt.publicKey, endpoints.PublicKey)
-			assert.Contains(t, endpoints.TracesURL, tt.projectID)
-			assert.Contains(t, endpoints.LogsURL, tt.projectID)
-		})
-	}
-}
-
 func TestExporterDataFlow(t *testing.T) {
 	type testCase struct {
 		name string
@@ -97,43 +41,13 @@ func TestExporterDataFlow(t *testing.T) {
 
 	tests := []testCase{
 		{
-			name: "dsn_mode_success",
-			config: &Config{
-				DSNMode: &DSNModeConfig{
-					DSN: "http://public_key@localhost/7654321",
-				},
-			},
-			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
-				return func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/traces" {
-						*traceReqs++
-					} else if r.URL.Path == "/logs" {
-						*logReqs++
-					}
-					w.WriteHeader(http.StatusOK)
-				}
-			},
-			setupMocks: nil,
-			prePopulateCache: func(state *endpointState, testServerAddr string) {
-				state.dsnEndpoint.TracesURL = "http://" + testServerAddr + "/traces"
-				state.dsnEndpoint.LogsURL = "http://" + testServerAddr + "/logs"
-			},
-			setupOnStart:          nil,
-			resourceAttributes:    nil,
-			expectedTraceRequests: 1,
-			expectedLogRequests:   1,
-			expectedError:         false,
-		},
-		{
 			name: "dynamic_mode_cached_project",
 			config: &Config{
-				DynamicMode: &DynamicModeConfig{
-					OrgSlug:   "test-org",
-					AuthToken: "test-token",
-					URL:       "https://sentry.io",
-					Routing: RoutingConfig{
-						AttributeForProject: "service.name",
-					},
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+				Routing: RoutingConfig{
+					AttributeForProject: "service.name",
 				},
 			},
 			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
@@ -170,14 +84,12 @@ func TestExporterDataFlow(t *testing.T) {
 		{
 			name: "dynamic_mode_project_creation",
 			config: &Config{
-				DynamicMode: &DynamicModeConfig{
-					OrgSlug:   "test-org",
-					AuthToken: "test-token",
-					URL:       "https://sentry.io",
-					Routing: RoutingConfig{
-						AttributeForProject: "service.name",
-						AutoCreateProjects:  true,
-					},
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+				Routing: RoutingConfig{
+					AttributeForProject: "service.name",
+					AutoCreateProjects:  true,
 				},
 			},
 			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
@@ -215,13 +127,11 @@ func TestExporterDataFlow(t *testing.T) {
 		{
 			name: "dynamic_mode_missing_routing_attribute",
 			config: &Config{
-				DynamicMode: &DynamicModeConfig{
-					OrgSlug:   "test-org",
-					AuthToken: "test-token",
-					URL:       "https://sentry.io",
-					Routing: RoutingConfig{
-						AttributeForProject: "service.name",
-					},
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+				Routing: RoutingConfig{
+					AttributeForProject: "service.name",
 				},
 			},
 			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
@@ -246,14 +156,12 @@ func TestExporterDataFlow(t *testing.T) {
 		{
 			name: "dynamic_mode_cache_invalidation_403",
 			config: &Config{
-				DynamicMode: &DynamicModeConfig{
-					OrgSlug:   "test-org",
-					AuthToken: "test-token",
-					URL:       "https://sentry.io",
-					Routing: RoutingConfig{
-						AttributeForProject: "service.name",
-						AutoCreateProjects:  false,
-					},
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+				Routing: RoutingConfig{
+					AttributeForProject: "service.name",
+					AutoCreateProjects:  false,
 				},
 			},
 			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
@@ -289,13 +197,11 @@ func TestExporterDataFlow(t *testing.T) {
 		{
 			name: "dynamic_mode_500_error_keeps_cache",
 			config: &Config{
-				DynamicMode: &DynamicModeConfig{
-					OrgSlug:   "test-org",
-					AuthToken: "test-token",
-					URL:       "https://sentry.io",
-					Routing: RoutingConfig{
-						AttributeForProject: "service.name",
-					},
+				OrgSlug:   "test-org",
+				AuthToken: "test-token",
+				URL:       "https://sentry.io",
+				Routing: RoutingConfig{
+					AttributeForProject: "service.name",
 				},
 			},
 			serverHandler: func(t *testing.T, traceReqs, logReqs *int) http.HandlerFunc {
@@ -340,13 +246,10 @@ func TestExporterDataFlow(t *testing.T) {
 			state, err := newEndpointState(tt.config, set)
 			require.NoError(t, err)
 
-			var mockClient *mockSentryClient
-			if tt.config.IsDynamicMode() {
-				mockClient = &mockSentryClient{}
-				state.sentryClient = mockClient
-				if tt.setupMocks != nil {
-					tt.setupMocks(mockClient)
-				}
+			mockClient := &mockSentryClient{}
+			state.sentryClient = mockClient
+			if tt.setupMocks != nil {
+				tt.setupMocks(mockClient)
 			}
 
 			if tt.prePopulateCache != nil {
@@ -367,7 +270,7 @@ func TestExporterDataFlow(t *testing.T) {
 
 			exp := newSignalExporter(state, set.Logger.With(zap.String("test", tt.name)))
 
-			if tt.config.IsDynamicMode() && tt.prePopulateCache == nil && tt.resourceAttributes != nil {
+			if tt.prePopulateCache == nil && tt.resourceAttributes != nil {
 				endpoint := &OTLPEndpoints{
 					TracesURL: "http://" + testServer.Listener.Addr().String() + "/traces",
 					LogsURL:   "http://" + testServer.Listener.Addr().String() + "/logs",
@@ -423,11 +326,9 @@ func TestExporterDataFlow(t *testing.T) {
 func TestStartPrePopulatesCache(t *testing.T) {
 	t.Run("loads_existing_projects", func(t *testing.T) {
 		cfg := &Config{
-			DynamicMode: &DynamicModeConfig{
-				OrgSlug:   "test-org",
-				AuthToken: "test-token",
-				URL:       "https://sentry.io",
-			},
+			OrgSlug:   "test-org",
+			AuthToken: "test-token",
+			URL:       "https://sentry.io",
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
@@ -476,11 +377,9 @@ func TestStartPrePopulatesCache(t *testing.T) {
 func TestGetOrCreateProjectEndpoint(t *testing.T) {
 	t.Run("project_exists_in_cache", func(t *testing.T) {
 		cfg := &Config{
-			DynamicMode: &DynamicModeConfig{
-				OrgSlug:   "test-org",
-				AuthToken: "test-token",
-				URL:       "https://sentry.io",
-			},
+			OrgSlug:   "test-org",
+			AuthToken: "test-token",
+			URL:       "https://sentry.io",
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
@@ -539,11 +438,9 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 
 	t.Run("handles_get_all_projects_error", func(t *testing.T) {
 		cfg := &Config{
-			DynamicMode: &DynamicModeConfig{
-				OrgSlug:   "test-org",
-				AuthToken: "test-token",
-				URL:       "https://sentry.io",
-			},
+			OrgSlug:   "test-org",
+			AuthToken: "test-token",
+			URL:       "https://sentry.io",
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
@@ -566,11 +463,9 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 
 	t.Run("continues_on_endpoint_fetch_error", func(t *testing.T) {
 		cfg := &Config{
-			DynamicMode: &DynamicModeConfig{
-				OrgSlug:   "test-org",
-				AuthToken: "test-token",
-				URL:       "https://sentry.io",
-			},
+			OrgSlug:   "test-org",
+			AuthToken: "test-token",
+			URL:       "https://sentry.io",
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())

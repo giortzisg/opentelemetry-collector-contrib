@@ -8,45 +8,34 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 exporters:
-  # DSN Mode
-  # This should be used for routing all telemetry to a single Sentry project
-  sentry/dsn:
-    dsn_mode:
-      dsn: "https://public_key@o123456.ingest.sentry.io/project_id"
-      timeout: 30s
-      insecure_skip_verify: false
-
-  # Dynamic Mode
-  # This should be used for routing different services to different Sentry projects
-  sentry/dynamic:
-    dynamic_mode:
-      url: "https://sentry.io"
-      org_slug: "my-organization" # dynamic mode routes to projects under the given org_slug
-      auth_token: "${env:SENTRY_AUTH_TOKEN}"
-      routing:
-        # Automatically create projects when they don't exist
-        auto_create_projects: true
-        
-        # Which resource attribute to use for routing (defaults to service.name)
-        attribute_for_project: "service.name"
-        
-        # Optional: explicit mappings from service name to project slug
-        # If not specified, the service.name value is used directly as the project slug
-        project_mapping:
-          api-service: "legacy-backend-api"
-          worker: "background-jobs"
-          frontend-app: "web-frontend"
+  sentry:
+    url: "https://sentry.io"
+    org_slug: "my-organization"
+    auth_token: "${env:SENTRY_AUTH_TOKEN}"
+    routing:
+      # Automatically create projects when they don't exist
+      auto_create_projects: true
       
-      timeout: 30s
-      insecure_skip_verify: false
+      # Which resource attribute to use for routing (defaults to service.name)
+      attribute_for_project: "service.name"
+      
+      # Optional: explicit mappings from service name to project slug
+      # If not specified, the service.name value is used directly as the project slug
+      project_mapping:
+        api-service: "legacy-backend-api"
+        worker: "background-jobs"
+        frontend-app: "web-frontend"
+    
+    timeout: 30s
+    insecure_skip_verify: false
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [sentry/dynamic] # using the dynamic exporter
+      exporters: [sentry]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [sentry/dynamic]
+      exporters: [sentry]

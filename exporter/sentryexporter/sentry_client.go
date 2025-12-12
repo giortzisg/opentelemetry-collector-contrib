@@ -225,19 +225,3 @@ func (c *SentryClient) GetOTLPEndpoints(ctx context.Context, orgSlug, projectSlu
 
 	return endpoints, nil
 }
-
-// ParseDSN parses a Sentry DSN and returns OTLP endpoints
-func ParseDSN(dsnString string) (*OTLPEndpoints, error) {
-	dsn, err := sentry.NewDsn(dsnString)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse DSN: %w", err)
-	}
-
-	endpoints := &OTLPEndpoints{
-		TracesURL: fmt.Sprintf("%s://%s/api/%s/integration/otlp/v1/traces/", dsn.GetScheme(), dsn.GetHost(), dsn.GetProjectID()),
-		LogsURL:   fmt.Sprintf("%s://%s/api/%s/integration/otlp/v1/logs/", dsn.GetScheme(), dsn.GetHost(), dsn.GetProjectID()),
-		PublicKey: dsn.GetPublicKey(),
-	}
-
-	return endpoints, nil
-}

@@ -35,8 +35,6 @@ type endpointState struct {
 	baseLogger *zap.Logger
 	client     *http.Client
 
-	dsnEndpoint *OTLPEndpoints
-
 	sentryClient SentryAPIClient
 
 	projectToEndpoint map[string]*OTLPEndpoints
@@ -62,6 +60,10 @@ type sentryExporter struct {
 }
 
 func newEndpointState(config *Config, set exporter.Settings) (*endpointState, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+
 	if config.Environment != "" {
 		set.Logger.Warn(
 			"The 'environment' field is deprecated and ignored. " +
@@ -90,36 +92,22 @@ func newEndpointState(config *Config, set exporter.Settings) (*endpointState, er
 		projectToEndpoint: make(map[string]*OTLPEndpoints),
 	}
 
-	switch {
-	case config.IsDSNMode():
-		endpoint, err := ParseDSN(config.DSNMode.DSN)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse DSN: %w", err)
-		}
-		state.dsnEndpoint = endpoint
-		set.Logger.Info("Configured in DSN mode", zap.String("dsn", config.DSNMode.DSN))
+	state.sentryClient = NewSentryClient(
+		config.URL,
+		string(config.AuthToken),
+		client,
+	)
 
-	case config.IsDynamicMode():
-		state.sentryClient = NewSentryClient(
-			config.DynamicMode.URL,
-			string(config.DynamicMode.AuthToken),
-			client,
-		)
-
-		state.attributeKey = config.DynamicMode.Routing.AttributeForProject
-		if state.attributeKey == "" {
-			state.attributeKey = DefaultAttributeForProject
-		}
-
-		state.projectMapping = config.DynamicMode.Routing.ProjectMapping
-		set.Logger.Info("Configured in dynamic mode",
-			zap.String("org", config.DynamicMode.OrgSlug),
-			zap.String("routing_attribute", state.attributeKey),
-			zap.Bool("auto_create_projects", config.DynamicMode.Routing.AutoCreateProjects))
-
-	default:
-		return nil, errors.New("exporter must be configured in either DSN or dynamic mode")
+	state.attributeKey = config.Routing.AttributeForProject
+	if state.attributeKey == "" {
+		state.attributeKey = DefaultAttributeForProject
 	}
+
+	state.projectMapping = config.Routing.ProjectMapping
+	set.Logger.Info("Configured in dynamic mode",
+		zap.String("org", config.OrgSlug),
+		zap.String("routing_attribute", state.attributeKey),
+		zap.Bool("auto_create_projects", config.Routing.AutoCreateProjects))
 
 	return state, nil
 }
@@ -142,10 +130,6 @@ func (s *endpointState) pushTraceData(ctx context.Context, logger *zap.Logger, t
 	}
 	if td.SpanCount() == 0 {
 		return nil
-	}
-
-	if s.config.IsDSNMode() {
-		return s.sendTracesToEndpoint(ctx, logger, td, s.dsnEndpoint)
 	}
 
 	return s.routeTracesByProject(ctx, logger, td)
@@ -253,17 +237,10 @@ func (s *endpointState) sendTracesToEndpoint(ctx context.Context, logger *zap.Lo
 // Start starts the exporter
 func (s *endpointState) Start(ctx context.Context, _ component.Host) error {
 	s.startOnce.Do(func() {
-		if s.config.IsDSNMode() {
-			s.baseLogger.Info("Starting sentryexporter in DSN mode",
-				zap.String("traces_endpoint", s.dsnEndpoint.TracesURL),
-				zap.String("logs_endpoint", s.dsnEndpoint.LogsURL))
-			return
-		}
-
 		s.baseLogger.Info("Starting sentryexporter in dynamic mode",
-			zap.String("org", s.config.DynamicMode.OrgSlug))
+			zap.String("org", s.config.OrgSlug))
 
-		projects, err := s.sentryClient.GetAllProjects(ctx, s.config.DynamicMode.OrgSlug)
+		projects, err := s.sentryClient.GetAllProjects(ctx, s.config.OrgSlug)
 		if err != nil {
 			s.baseLogger.Warn("Failed to pre-populate project cache",
 				zap.Error(err))
@@ -277,7 +254,7 @@ func (s *endpointState) Start(ctx context.Context, _ component.Host) error {
 				s.defaultTeamSlug = project.Teams[0].Slug
 			}
 
-			endpoint, err := s.sentryClient.GetOTLPEndpoints(ctx, s.config.DynamicMode.OrgSlug, project.Slug)
+			endpoint, err := s.sentryClient.GetOTLPEndpoints(ctx, s.config.OrgSlug, project.Slug)
 			if err != nil {
 				s.baseLogger.Warn("Failed to fetch endpoint for project",
 					zap.String("project", project.Slug),
@@ -315,10 +292,6 @@ func (s *endpointState) pushLogData(ctx context.Context, logger *zap.Logger, ld 
 	}
 	if ld.LogRecordCount() == 0 {
 		return nil
-	}
-
-	if s.config.IsDSNMode() {
-		return s.sendLogsToEndpoint(ctx, logger, ld, s.dsnEndpoint)
 	}
 
 	return s.routeLogsByProject(ctx, logger, ld)
@@ -504,7 +477,7 @@ func (s *endpointState) getOrCreateProjectEndpoint(ctx context.Context, logger *
 		}
 		s.projectMapMu.RUnlock()
 
-		endpoint, fetchErr := s.sentryClient.GetOTLPEndpoints(ctx, s.config.DynamicMode.OrgSlug, projectSlug)
+		endpoint, fetchErr := s.sentryClient.GetOTLPEndpoints(ctx, s.config.OrgSlug, projectSlug)
 		if fetchErr == nil {
 			s.projectMapMu.Lock()
 			s.projectToEndpoint[projectSlug] = endpoint
@@ -512,7 +485,7 @@ func (s *endpointState) getOrCreateProjectEndpoint(ctx context.Context, logger *
 			return endpoint, nil
 		}
 
-		if !s.config.DynamicMode.Routing.AutoCreateProjects {
+		if !s.config.Routing.AutoCreateProjects {
 			return nil, fmt.Errorf("project %s not found and auto_create_projects is disabled", projectSlug)
 		}
 
@@ -530,11 +503,11 @@ func (s *endpointState) getOrCreateProjectEndpoint(ctx context.Context, logger *
 		}
 		s.projectMapMu.RUnlock()
 
-		if _, err := s.sentryClient.CreateProject(ctx, s.config.DynamicMode.OrgSlug, s.defaultTeamSlug, projectSlug, projectSlug, platform); err != nil {
+		if _, err := s.sentryClient.CreateProject(ctx, s.config.OrgSlug, s.defaultTeamSlug, projectSlug, projectSlug, platform); err != nil {
 			return nil, fmt.Errorf("failed to create project %s: %w", projectSlug, err)
 		}
 
-		endpoint, err := s.sentryClient.GetOTLPEndpoints(ctx, s.config.DynamicMode.OrgSlug, projectSlug)
+		endpoint, err := s.sentryClient.GetOTLPEndpoints(ctx, s.config.OrgSlug, projectSlug)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get endpoints for newly created project %s: %w", projectSlug, err)
 		}

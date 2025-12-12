@@ -24,15 +24,15 @@ func TestCreateDefaultConfig(t *testing.T) {
 	assert.NotNil(t, cfg)
 	err := cfg.(*Config).Validate()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "either 'dsn_mode' or 'dynamic_mode' must be configured")
+	assert.Contains(t, err.Error(), "'url' must be configured")
 }
 
 func TestCreateTracesExporter(t *testing.T) {
 	factory := NewFactory()
 	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-		},
+		URL:       "https://sentry.io",
+		OrgSlug:   "test-org",
+		AuthToken: "test-token",
 	}
 
 	set := exportertest.NewNopSettings(factory.Type())
@@ -45,9 +45,9 @@ func TestCreateTracesExporter(t *testing.T) {
 func TestCreateLogsExporter(t *testing.T) {
 	factory := NewFactory()
 	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-		},
+		URL:       "https://sentry.io",
+		OrgSlug:   "test-org",
+		AuthToken: "test-token",
 	}
 
 	set := exportertest.NewNopSettings(factory.Type())
@@ -59,7 +59,7 @@ func TestCreateLogsExporter(t *testing.T) {
 
 func TestCreateExporterWithInvalidConfig(t *testing.T) {
 	factory := NewFactory()
-	cfg := &Config{} // Invalid: no DSNMode or DynamicMode config
+	cfg := &Config{} // Invalid: no dynamic config
 
 	set := exportertest.NewNopSettings(factory.Type())
 	_, err := createTracesExporter(context.Background(), set, cfg)
@@ -69,9 +69,9 @@ func TestCreateExporterWithInvalidConfig(t *testing.T) {
 
 func TestSharedComponentSingleton(t *testing.T) {
 	cfg := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-		},
+		URL:       "https://sentry.io",
+		OrgSlug:   "test-org",
+		AuthToken: "test-token",
 	}
 
 	factory := NewFactory()
@@ -105,15 +105,15 @@ func TestSharedComponentSingleton(t *testing.T) {
 
 func TestSharedComponentDifferentConfigs(t *testing.T) {
 	cfg1 := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key1@o123456.ingest.sentry.io/7654321",
-		},
+		URL:       "https://sentry.io",
+		OrgSlug:   "org1",
+		AuthToken: "test-token",
 	}
 
 	cfg2 := &Config{
-		DSNMode: &DSNModeConfig{
-			DSN: "https://public_key2@o123456.ingest.sentry.io/7654321",
-		},
+		URL:       "https://sentry.io",
+		OrgSlug:   "org2",
+		AuthToken: "test-token",
 	}
 
 	factory := NewFactory()

@@ -1,52 +1,31 @@
-# Default configuration with DSN mode
+# Minimal dynamic configuration
 sentry:
-  dsn_mode:
-    dsn: https://public_key@o123456.ingest.sentry.io/7654321
+  url: https://sentry.io
+  org_slug: my-org
+  auth_token: test-auth-token-12345
 
-# DSN mode with timeout
-sentry/dsn_with_timeout:
-  dsn_mode:
-    dsn: https://public_key@o123456.ingest.sentry.io/7654321
-    timeout: 60s
+# Dynamic configuration with routing options
+sentry/with_routing:
+  url: https://sentry.io
+  org_slug: my-org
+  auth_token: test-auth-token-12345
+  routing:
+    auto_create_projects: true
+    attribute_for_project: service.name
+    project_mapping:
+      api-service: backend-api
+      web-service: frontend-web
 
-# DSN mode with insecure_skip_verify
-sentry/dsn_insecure:
-  dsn_mode:
-    dsn: https://public_key@o123456.ingest.sentry.io/7654321
-    insecure_skip_verify: true
-    timeout: 30s
-
-# Dynamic mode basic configuration
-sentry/dynamic_basic:
-  dynamic_mode:
-    url: https://sentry.io
-    org_slug: my-org
-    auth_token: test-auth-token-12345
-
-# Dynamic mode with routing
-sentry/dynamic_with_routing:
-  dynamic_mode:
-    url: https://sentry.io
-    org_slug: my-org
-    auth_token: test-auth-token-12345
-    routing:
-      auto_create_projects: true
-      attribute_for_project: service.name
-      project_mapping:
-        api-service: backend-api
-        web-service: frontend-web
-
-# Dynamic mode full configuration
-sentry/dynamic_full:
-  dynamic_mode:
-    url: https://sentry.example.com
-    org_slug: example-org
-    auth_token: full-test-token
-    timeout: 45s
-    insecure_skip_verify: true
-    routing:
-      auto_create_projects: true
-      attribute_for_project: deployment.environment.name
-      project_mapping:
-        production: prod-project
-        staging: stage-project
+# Dynamic configuration with all options
+sentry/full:
+  url: https://sentry.example.com
+  org_slug: example-org
+  auth_token: full-test-token
+  timeout: 45s
+  insecure_skip_verify: true
+  routing:
+    auto_create_projects: true
+    attribute_for_project: deployment.environment.name
+    project_mapping:
+      production: prod-project
+      staging: stage-project

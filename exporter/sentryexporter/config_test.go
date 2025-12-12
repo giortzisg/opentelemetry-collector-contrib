@@ -32,66 +32,26 @@ func TestLoadConfig(t *testing.T) {
 		{
 			id: component.NewIDWithName(metadata.Type, ""),
 			expected: &Config{
-				DSNMode: &DSNModeConfig{
-					DSN: "https://public_key@o123456.ingest.sentry.io/7654321",
-				},
+				URL:       "https://sentry.io",
+				OrgSlug:   "my-org",
+				AuthToken: configopaque.String("test-auth-token-12345"),
 				ClientConfig: confighttp.ClientConfig{
 					Timeout: 30 * time.Second,
 				},
 			},
 		},
 		{
-			id: component.NewIDWithName(metadata.Type, "dsn_with_timeout"),
+			id: component.NewIDWithName(metadata.Type, "with_routing"),
 			expected: &Config{
-				DSNMode: &DSNModeConfig{
-					DSN:     "https://public_key@o123456.ingest.sentry.io/7654321",
-					Timeout: 60 * time.Second,
-				},
-				ClientConfig: confighttp.ClientConfig{
-					Timeout: 30 * time.Second,
-				},
-			},
-		},
-		{
-			id: component.NewIDWithName(metadata.Type, "dsn_insecure"),
-			expected: &Config{
-				DSNMode: &DSNModeConfig{
-					DSN:                "https://public_key@o123456.ingest.sentry.io/7654321",
-					InsecureSkipVerify: true,
-					Timeout:            30 * time.Second,
-				},
-				ClientConfig: confighttp.ClientConfig{
-					Timeout: 30 * time.Second,
-				},
-			},
-		},
-		{
-			id: component.NewIDWithName(metadata.Type, "dynamic_basic"),
-			expected: &Config{
-				DynamicMode: &DynamicModeConfig{
-					URL:       "https://sentry.io",
-					OrgSlug:   "my-org",
-					AuthToken: configopaque.String("test-auth-token-12345"),
-				},
-				ClientConfig: confighttp.ClientConfig{
-					Timeout: 30 * time.Second,
-				},
-			},
-		},
-		{
-			id: component.NewIDWithName(metadata.Type, "dynamic_with_routing"),
-			expected: &Config{
-				DynamicMode: &DynamicModeConfig{
-					URL:       "https://sentry.io",
-					OrgSlug:   "my-org",
-					AuthToken: configopaque.String("test-auth-token-12345"),
-					Routing: RoutingConfig{
-						AutoCreateProjects:  true,
-						AttributeForProject: "service.name",
-						ProjectMapping: map[string]string{
-							"api-service": "backend-api",
-							"web-service": "frontend-web",
-						},
+				URL:       "https://sentry.io",
+				OrgSlug:   "my-org",
+				AuthToken: configopaque.String("test-auth-token-12345"),
+				Routing: RoutingConfig{
+					AutoCreateProjects:  true,
+					AttributeForProject: "service.name",
+					ProjectMapping: map[string]string{
+						"api-service": "backend-api",
+						"web-service": "frontend-web",
 					},
 				},
 				ClientConfig: confighttp.ClientConfig{
@@ -100,25 +60,23 @@ func TestLoadConfig(t *testing.T) {
 			},
 		},
 		{
-			id: component.NewIDWithName(metadata.Type, "dynamic_full"),
+			id: component.NewIDWithName(metadata.Type, "full"),
 			expected: &Config{
-				DynamicMode: &DynamicModeConfig{
-					URL:                "https://sentry.example.com",
-					OrgSlug:            "example-org",
-					AuthToken:          configopaque.String("full-test-token"),
-					Timeout:            45 * time.Second,
-					InsecureSkipVerify: true,
-					Routing: RoutingConfig{
-						AutoCreateProjects:  true,
-						AttributeForProject: "deployment.environment.name",
-						ProjectMapping: map[string]string{
-							"production": "prod-project",
-							"staging":    "stage-project",
-						},
+				URL:                "https://sentry.example.com",
+				OrgSlug:            "example-org",
+				AuthToken:          configopaque.String("full-test-token"),
+				Timeout:            45 * time.Second,
+				InsecureSkipVerify: true,
+				Routing: RoutingConfig{
+					AutoCreateProjects:  true,
+					AttributeForProject: "deployment.environment.name",
+					ProjectMapping: map[string]string{
+						"production": "prod-project",
+						"staging":    "stage-project",
 					},
 				},
 				ClientConfig: confighttp.ClientConfig{
-					Timeout: 30 * time.Second,
+					Timeout: 45 * time.Second,
 				},
 			},
 		},
