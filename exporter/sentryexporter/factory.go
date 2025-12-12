@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.uber.org/zap"
 )
 
 // NewFactory creates a factory for Sentry exporter.
@@ -42,10 +43,11 @@ func createTracesExporter(
 	set exporter.Settings,
 	config component.Config,
 ) (exporter.Traces, error) {
-	sc, se, err := getOrCreateSentryExporter(config, set)
+	sc, state, err := getOrCreateEndpointState(config, set)
 	if err != nil {
 		return nil, err
 	}
+	se := newSignalExporter(state, set.Logger.With(zap.String("signal", "traces")))
 	return exporterhelper.NewTraces(
 		ctx,
 		set,
@@ -62,10 +64,11 @@ func createLogsExporter(
 	set exporter.Settings,
 	config component.Config,
 ) (exporter.Logs, error) {
-	sc, se, err := getOrCreateSentryExporter(config, set)
+	sc, state, err := getOrCreateEndpointState(config, set)
 	if err != nil {
 		return nil, err
 	}
+	se := newSignalExporter(state, set.Logger.With(zap.String("signal", "logs")))
 	return exporterhelper.NewLogs(
 		ctx,
 		set,
@@ -77,11 +80,11 @@ func createLogsExporter(
 	)
 }
 
-// getOrCreateSentryExporter creates a sentryExporter and caches it for a particular configuration.
-func getOrCreateSentryExporter(cfg component.Config, set exporter.Settings) (*sharedcomponent.SharedComponent, *sentryExporter, error) {
-	sc := exporters.GetOrAdd(cfg, func() component.Component {
+// getOrCreateEndpointState creates an endpointState and caches it for a particular configuration.
+func getOrCreateEndpointState(cfg component.Config, set exporter.Settings) (*sharedcomponent.SharedComponent, *endpointState, error) {
+	sc := states.GetOrAdd(cfg, func() component.Component {
 		sentryConfig := cfg.(*Config)
-		se, err := newSentryExporter(sentryConfig, set)
+		se, err := newEndpointState(sentryConfig, set)
 		if err != nil {
 			return nil
 		}
@@ -92,7 +95,7 @@ func getOrCreateSentryExporter(cfg component.Config, set exporter.Settings) (*sh
 	if unwrapped == nil {
 		return nil, nil, fmt.Errorf("failed to create sentry exporter")
 	}
-	return sc, unwrapped.(*sentryExporter), nil
+	return sc, unwrapped.(*endpointState), nil
 }
 
-var exporters = sharedcomponent.NewSharedComponents()
+var states = sharedcomponent.NewSharedComponents()

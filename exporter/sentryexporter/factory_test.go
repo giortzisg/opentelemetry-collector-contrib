@@ -85,13 +85,13 @@ func TestSharedComponentSingleton(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, logsExp)
 
-	sc1, se1, err := getOrCreateSentryExporter(cfg, set)
+	sc1, st1, err := getOrCreateEndpointState(cfg, set)
 	require.NoError(t, err)
-	sc2, se2, err := getOrCreateSentryExporter(cfg, set)
+	sc2, st2, err := getOrCreateEndpointState(cfg, set)
 	require.NoError(t, err)
 
 	assert.Same(t, sc1, sc2, "SharedComponents should be the same instance")
-	assert.Same(t, se1, se2, "Unwrapped exporters should be the same instance")
+	assert.Same(t, st1, st2, "Unwrapped states should be the same instance")
 
 	err = tracesExp.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
@@ -125,12 +125,12 @@ func TestSharedComponentDifferentConfigs(t *testing.T) {
 	exp2, err := factory.CreateTraces(context.Background(), set, cfg2)
 	require.NoError(t, err)
 
-	_, se1, err := getOrCreateSentryExporter(cfg1, set)
+	_, st1, err := getOrCreateEndpointState(cfg1, set)
 	require.NoError(t, err)
-	_, se2, err := getOrCreateSentryExporter(cfg2, set)
+	_, st2, err := getOrCreateEndpointState(cfg2, set)
 	require.NoError(t, err)
 
-	assert.NotSame(t, se1, se2, "Different configs should create different exporter instances")
+	assert.NotSame(t, st1, st2, "Different configs should create different states")
 
 	err = exp1.Shutdown(context.Background())
 	require.NoError(t, err)

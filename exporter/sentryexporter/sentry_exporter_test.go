@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/testdata"
 )
@@ -82,8 +83,8 @@ func TestExporterDataFlow(t *testing.T) {
 
 		serverHandler    func(*testing.T, *int, *int) http.HandlerFunc
 		setupMocks       func(*mockSentryClient)
-		prePopulateCache func(*sentryExporter, string)
-		setupOnStart     func(*sentryExporter) error
+		prePopulateCache func(*endpointState, string)
+		setupOnStart     func(*endpointState) error
 
 		resourceAttributes map[string]string
 
@@ -91,7 +92,7 @@ func TestExporterDataFlow(t *testing.T) {
 		expectedLogRequests   int
 		expectedError         bool
 
-		assertExpectations func(*testing.T, *sentryExporter, *mockSentryClient)
+		assertExpectations func(*testing.T, *endpointState, *mockSentryClient)
 	}
 
 	tests := []testCase{
@@ -113,9 +114,9 @@ func TestExporterDataFlow(t *testing.T) {
 				}
 			},
 			setupMocks: nil,
-			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
-				exp.dsnEndpoint.TracesURL = "http://" + testServerAddr + "/traces"
-				exp.dsnEndpoint.LogsURL = "http://" + testServerAddr + "/logs"
+			prePopulateCache: func(state *endpointState, testServerAddr string) {
+				state.dsnEndpoint.TracesURL = "http://" + testServerAddr + "/traces"
+				state.dsnEndpoint.LogsURL = "http://" + testServerAddr + "/logs"
 			},
 			setupOnStart:          nil,
 			resourceAttributes:    nil,
@@ -149,8 +150,8 @@ func TestExporterDataFlow(t *testing.T) {
 				mc.On("GetAllProjects", mock.Anything, "test-org").
 					Return([]ProjectInfo{}, nil)
 			},
-			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
-				exp.projectToEndpoint["my-service"] = &OTLPEndpoints{
+			prePopulateCache: func(state *endpointState, testServerAddr string) {
+				state.projectToEndpoint["my-service"] = &OTLPEndpoints{
 					TracesURL: "http://" + testServerAddr + "/traces",
 					LogsURL:   "http://" + testServerAddr + "/logs",
 					PublicKey: "test-key",
@@ -162,7 +163,7 @@ func TestExporterDataFlow(t *testing.T) {
 			expectedTraceRequests: 1,
 			expectedLogRequests:   1,
 			expectedError:         false,
-			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+			assertExpectations: func(t *testing.T, state *endpointState, mc *mockSentryClient) {
 				mc.AssertNotCalled(t, "CreateProject")
 			},
 		},
@@ -194,8 +195,8 @@ func TestExporterDataFlow(t *testing.T) {
 					Return([]ProjectInfo{}, nil)
 			},
 			prePopulateCache: nil,
-			setupOnStart: func(exp *sentryExporter) error {
-				exp.defaultTeamSlug = "test-team"
+			setupOnStart: func(state *endpointState) error {
+				state.defaultTeamSlug = "test-team"
 				return nil
 			},
 			resourceAttributes: map[string]string{
@@ -205,10 +206,10 @@ func TestExporterDataFlow(t *testing.T) {
 			expectedTraceRequests: 1,
 			expectedLogRequests:   1,
 			expectedError:         false,
-			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+			assertExpectations: func(t *testing.T, state *endpointState, mc *mockSentryClient) {
 				mc.AssertCalled(t, "GetOTLPEndpoints", mock.Anything, "test-org", "new-service")
 				mc.AssertCalled(t, "CreateProject", mock.Anything, "test-org", "test-team", "new-service", "new-service", "python")
-				assert.Len(t, exp.projectToEndpoint, 1, "Should have cached the new project")
+				assert.Len(t, state.projectToEndpoint, 1, "Should have cached the new project")
 			},
 		},
 		{
@@ -237,7 +238,7 @@ func TestExporterDataFlow(t *testing.T) {
 			expectedTraceRequests: 0,
 			expectedLogRequests:   0,
 			expectedError:         false,
-			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
+			assertExpectations: func(t *testing.T, state *endpointState, mc *mockSentryClient) {
 				mc.AssertNotCalled(t, "GetOTLPEndpoints")
 				mc.AssertNotCalled(t, "CreateProject")
 			},
@@ -267,8 +268,8 @@ func TestExporterDataFlow(t *testing.T) {
 				mc.On("GetOTLPEndpoints", mock.Anything, "test-org", "test-service").
 					Return((*OTLPEndpoints)(nil), assert.AnError)
 			},
-			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
-				exp.projectToEndpoint["test-service"] = &OTLPEndpoints{
+			prePopulateCache: func(state *endpointState, testServerAddr string) {
+				state.projectToEndpoint["test-service"] = &OTLPEndpoints{
 					TracesURL: "http://" + testServerAddr + "/traces",
 					LogsURL:   "http://" + testServerAddr + "/logs",
 					PublicKey: "test-key",
@@ -280,8 +281,8 @@ func TestExporterDataFlow(t *testing.T) {
 			expectedTraceRequests: 0,
 			expectedLogRequests:   0,
 			expectedError:         true,
-			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
-				_, exists := exp.projectToEndpoint["test-service"]
+			assertExpectations: func(t *testing.T, state *endpointState, mc *mockSentryClient) {
+				_, exists := state.projectToEndpoint["test-service"]
 				assert.False(t, exists, "Cache should be invalidated after 403")
 			},
 		},
@@ -307,8 +308,8 @@ func TestExporterDataFlow(t *testing.T) {
 				mc.On("GetAllProjects", mock.Anything, "test-org").
 					Return([]ProjectInfo{}, nil)
 			},
-			prePopulateCache: func(exp *sentryExporter, testServerAddr string) {
-				exp.projectToEndpoint["test-service"] = &OTLPEndpoints{
+			prePopulateCache: func(state *endpointState, testServerAddr string) {
+				state.projectToEndpoint["test-service"] = &OTLPEndpoints{
 					TracesURL: "http://" + testServerAddr + "/traces",
 					LogsURL:   "http://" + testServerAddr + "/logs",
 					PublicKey: "test-key",
@@ -320,8 +321,8 @@ func TestExporterDataFlow(t *testing.T) {
 			expectedTraceRequests: 0,
 			expectedLogRequests:   0,
 			expectedError:         true,
-			assertExpectations: func(t *testing.T, exp *sentryExporter, mc *mockSentryClient) {
-				_, exists := exp.projectToEndpoint["test-service"]
+			assertExpectations: func(t *testing.T, state *endpointState, mc *mockSentryClient) {
+				_, exists := state.projectToEndpoint["test-service"]
 				assert.True(t, exists, "Cache should NOT be invalidated on 500 errors")
 			},
 		},
@@ -336,33 +337,35 @@ func TestExporterDataFlow(t *testing.T) {
 			defer testServer.Close()
 
 			set := exportertest.NewNopSettings(NewFactory().Type())
-			exp, err := newSentryExporter(tt.config, set)
+			state, err := newEndpointState(tt.config, set)
 			require.NoError(t, err)
 
 			var mockClient *mockSentryClient
 			if tt.config.IsDynamicMode() {
 				mockClient = &mockSentryClient{}
-				exp.sentryClient = mockClient
+				state.sentryClient = mockClient
 				if tt.setupMocks != nil {
 					tt.setupMocks(mockClient)
 				}
 			}
 
 			if tt.prePopulateCache != nil {
-				tt.prePopulateCache(exp, testServer.Listener.Addr().String())
+				tt.prePopulateCache(state, testServer.Listener.Addr().String())
 			}
 
 			if tt.setupOnStart != nil {
-				err = tt.setupOnStart(exp)
+				err = tt.setupOnStart(state)
 				require.NoError(t, err)
 			}
 
-			err = exp.Start(context.Background(), componenttest.NewNopHost())
+			err = state.Start(context.Background(), componenttest.NewNopHost())
 			require.NoError(t, err)
 			defer func() {
-				err = exp.Shutdown(context.Background())
+				err = state.Shutdown(context.Background())
 				require.NoError(t, err)
 			}()
+
+			exp := newSignalExporter(state, set.Logger.With(zap.String("test", tt.name)))
 
 			if tt.config.IsDynamicMode() && tt.prePopulateCache == nil && tt.resourceAttributes != nil {
 				endpoint := &OTLPEndpoints{
@@ -407,7 +410,7 @@ func TestExporterDataFlow(t *testing.T) {
 			assert.Equal(t, tt.expectedLogRequests, logRequests)
 
 			if tt.assertExpectations != nil {
-				tt.assertExpectations(t, exp, mockClient)
+				tt.assertExpectations(t, state, mockClient)
 			}
 
 			if mockClient != nil {
@@ -428,11 +431,11 @@ func TestStartPrePopulatesCache(t *testing.T) {
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
-		exp, err := newSentryExporter(cfg, set)
+		state, err := newEndpointState(cfg, set)
 		require.NoError(t, err)
 
 		mockClient := &mockSentryClient{}
-		exp.sentryClient = mockClient
+		state.sentryClient = mockClient
 
 		projects := []ProjectInfo{
 			{Slug: "project1", Teams: []TeamInfo{{Slug: "team1"}}},
@@ -458,13 +461,13 @@ func TestStartPrePopulatesCache(t *testing.T) {
 		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
 			Return(endpoint2, nil)
 
-		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		err = state.Start(context.Background(), componenttest.NewNopHost())
 		require.NoError(t, err)
 
-		assert.Len(t, exp.projectToEndpoint, 2)
-		assert.Equal(t, endpoint1, exp.projectToEndpoint["project1"])
-		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
-		assert.Equal(t, "team1", exp.defaultTeamSlug)
+		assert.Len(t, state.projectToEndpoint, 2)
+		assert.Equal(t, endpoint1, state.projectToEndpoint["project1"])
+		assert.Equal(t, endpoint2, state.projectToEndpoint["project2"])
+		assert.Equal(t, "team1", state.defaultTeamSlug)
 
 		mockClient.AssertExpectations(t)
 	})
@@ -481,11 +484,11 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
-		exp, err := newSentryExporter(cfg, set)
+		state, err := newEndpointState(cfg, set)
 		require.NoError(t, err)
 
 		mockClient := &mockSentryClient{}
-		exp.sentryClient = mockClient
+		state.sentryClient = mockClient
 
 		projects := []ProjectInfo{
 			{
@@ -523,13 +526,13 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
 			Return(endpoint2, nil)
 
-		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		err = state.Start(context.Background(), componenttest.NewNopHost())
 		require.NoError(t, err)
 
-		assert.Len(t, exp.projectToEndpoint, 2, "Should have cached 2 projects")
-		assert.Equal(t, endpoint1, exp.projectToEndpoint["project1"])
-		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
-		assert.Equal(t, "team1", exp.defaultTeamSlug, "Should set default team")
+		assert.Len(t, state.projectToEndpoint, 2, "Should have cached 2 projects")
+		assert.Equal(t, endpoint1, state.projectToEndpoint["project1"])
+		assert.Equal(t, endpoint2, state.projectToEndpoint["project2"])
+		assert.Equal(t, "team1", state.defaultTeamSlug, "Should set default team")
 
 		mockClient.AssertExpectations(t)
 	})
@@ -544,19 +547,19 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
-		exp, err := newSentryExporter(cfg, set)
+		state, err := newEndpointState(cfg, set)
 		require.NoError(t, err)
 
 		mockClient := &mockSentryClient{}
-		exp.sentryClient = mockClient
+		state.sentryClient = mockClient
 
 		mockClient.On("GetAllProjects", mock.Anything, "test-org").
 			Return(([]ProjectInfo)(nil), assert.AnError)
 
-		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		err = state.Start(context.Background(), componenttest.NewNopHost())
 		require.NoError(t, err, "Should not fail on pre-population error")
 
-		assert.Empty(t, exp.projectToEndpoint, "Cache should be empty")
+		assert.Empty(t, state.projectToEndpoint, "Cache should be empty")
 
 		mockClient.AssertExpectations(t)
 	})
@@ -571,11 +574,11 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 		}
 
 		set := exportertest.NewNopSettings(NewFactory().Type())
-		exp, err := newSentryExporter(cfg, set)
+		state, err := newEndpointState(cfg, set)
 		require.NoError(t, err)
 
 		mockClient := &mockSentryClient{}
-		exp.sentryClient = mockClient
+		state.sentryClient = mockClient
 
 		projects := []ProjectInfo{
 			{Slug: "project1", Teams: []TeamInfo{{Slug: "team1"}}},
@@ -597,11 +600,11 @@ func TestGetOrCreateProjectEndpoint(t *testing.T) {
 		mockClient.On("GetOTLPEndpoints", mock.Anything, "test-org", "project2").
 			Return(endpoint2, nil)
 
-		err = exp.Start(context.Background(), componenttest.NewNopHost())
+		err = state.Start(context.Background(), componenttest.NewNopHost())
 		require.NoError(t, err)
 
-		assert.Len(t, exp.projectToEndpoint, 1, "Should have cached 1 project (skipped the error)")
-		assert.Equal(t, endpoint2, exp.projectToEndpoint["project2"])
+		assert.Len(t, state.projectToEndpoint, 1, "Should have cached 1 project (skipped the error)")
+		assert.Equal(t, endpoint2, state.projectToEndpoint["project2"])
 
 		mockClient.AssertExpectations(t)
 	})
